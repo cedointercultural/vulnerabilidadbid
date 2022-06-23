@@ -1,0 +1,1664 @@
+---
+title: "Análisis para la determinación de vulnerabilidad de las comunidades pesqueras y acuícolas."
+output: html_notebook
+---
+
+Este producto es considerado esencial para dirigir esfuerzos de adaptación al cambio climático. El marco de evaluación de la vulnerabilidad de pesquerías arrecifales publicado por FAO (Cinner et al. http://www.fao.org/3/a-ap972e.pdf) sugiere que para denotar cuáles comunidades se encuentran en mayor riesgo por efectos del cambio climático, se deben balancear de manera additiva tres variables: exposición (daños potenciales a futuro), susceptibilidad (situación actual que pone en riesgo a las personas) y capacidad adaptativa (potencial para resolver los problemas ocasionados por las modificaciones climáticas). En este caso se llevará a cabo una evaluación rápida de la vulnerabilidad a comunidades costeras de México (definidas como aquellas alejadas un máximo de 30 km de la línea de costa, y con más de 100 habitantes), a partir de información generada durante el estudio y datos de INEGI y del Directorio Nacional de Actividades Económicas. Los indicadores de exposición serán los cambios esperados en temperatura y productividad primaria frente a cada comunidad, mientras que los de susceptibilidad serán tres: población ocupada (indicador del estado económico de las personas), población empleada en actividades primarias (donde se incluye la pesca) y, número de casas habitación con servicios (agua, electricidad, drenaje). Finalmente, la capacidad de adaptación por localidad se estimará con base en el grado promedio de escolaridad de la población, el porcentaje con servicios de salud pública, y población menor a 15 años (que representa la fuerza de trabajo a futuro mediato).
+
+
+```{r libraries, include=FALSE}
+source("libraries.R")
+source("pca_factor.R")
+source("datos_denue.R")
+source("grafico_datos.R")
+source("grafico_datos_exp.R")
+source("expo_raster.R")
+source("vul_analisis.R")
+source("make_map.R")
+source("raster_scale.R")
+source("calc_buffer.R")
+```
+
+                                    
+```{r}
+#datos pueden ser obtenidos de https://www.inegi.org.mx/contenidos/programas/ccpv/2020/datosabiertos/iter/iter_00_cpv2020_csv.zip
+
+#https://epsg.io/4485
+crs.proj.utm <- ("+proj=utm +zone=12 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs +datum=NAD83") 
+crs.proj.wgs <- "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"
+
+#oceanos
+atlantic.shp <- st_read(paste0(here(),"/inputs/shp_files/atlantic_ocean.shp"))
+atlantic.shp.proj <- st_transform(atlantic.shp, crs.proj.utm)
+
+pacific.shp <- st_read(paste0(here(),"/inputs/shp_files/pacific_ocean.shp"))
+pacific.shp.proj <- st_transform(pacific.shp, crs.proj.utm)
+
+#estados de la Republica
+est.2019 <- st_read(paste0(here(),"/inputs/datos_INEGI_2020/dest2019gw.shp"))
+
+#estados.mx <- cbind(est.2019, st_coordinates(st_centroid(est.2019)))
+
+#Datos censo 2020
+inegi.2020 <- read_csv(paste0(here(),"/inputs/datos_INEGI_2020/conjunto_de_datos/conjunto_de_datos_iter_00_cpv2020.csv"))
+
+#Decimal Degrees = degrees + (minutes/60) + (seconds/3600)
+
+#calcular grados decimales en base a coordenadas grados minutos segundos
+inegi.2020.id <- inegi.2020 %>% 
+  filter(!is.na(LONGITUD)) %>% 
+  mutate(COM_ID = paste0(ENTIDAD,"_",MUN, "_",LOC)) %>% 
+  dplyr::select(COM_ID, everything()) %>% 
+  separate(LONGITUD,c("lon_deg","lon"),"°") %>% 
+  separate(lon,c("lon_min","lon_sec"),"'") %>% 
+  mutate(lon_sec = gsub("\".*\ W","",lon_sec)) %>% 
+  separate(LATITUD,c("lat_deg","lat"),"°") %>% 
+  separate(lat,c("lat_min","lat_sec"),"'") %>% 
+  mutate(lat_sec = gsub("\".*\ N","",lat_sec)) %>% 
+  mutate(across(lon_deg:lat_sec,as.numeric)) %>% 
+  mutate(dec_lon= (lon_deg + (lon_min / 60) + (lon_sec / 3600))*-1, 
+         dec_lat=(lat_deg + (lat_min / 60) + (lat_sec / 3600))) %>% 
+  mutate(across(POBFEM:TAMLOC, as.numeric)) 
+
+#convertir en capa geografica
+inegi.2020.coords <- inegi.2020.id
+
+coordinates(inegi.2020.coords) <- c("dec_lon","dec_lat")
+
+#definir proyeccion geografica y proyectar a utm
+proj4string(inegi.2020.coords) <- crs.proj.wgs
+inegi.2020.coords.sf <- st_as_sf(inegi.2020.coords)
+inegi.2020.coords.proj <- st_transform(inegi.2020.coords.sf, crs.proj.utm)
+
+#delimitar datos censales a estados costeros
+inegi.edo.coste <- inegi.2020.coords.proj %>% 
+  filter(NOM_ENT %in% c("Baja California Sur", "Baja California", "Sonora", "Sinaloa", "Nayarit", "Jalisco", "Colima", "Michoacán de Ocampo", "Guerrero", "Oaxaca", "Chiapas", "Quintana Roo", "Yucatán", "Campeche", "Tabasco", "Veracruz de Ignacio de la Llave", "Tamaulipas")) %>% 
+  mutate(id_row = 1:nrow(.))
+
+#seleccionar comunidades costeras a 30 km de la costa del Pacifico
+distance.pacific <- st_distance(inegi.edo.coste, st_cast(pacific.shp.proj,"POLYGON")) %>% 
+  as_tibble() %>% 
+  mutate(id_row = 1:nrow(.)) 
+
+rows.coast.pacific <- distance.pacific %>% 
+  mutate(dist = as.numeric(value)) %>% 
+  filter(dist<30000) %>% 
+  pull(id_row)
+
+inegi.coste.pacific <- inegi.edo.coste %>% 
+  filter(id_row %in% rows.coast.pacific) 
+
+#seleccionar comunidades costeras a 30 km de la costa del Atlantico
+#https://gis.stackexchange.com/questions/343222/remove-points-that-are-close-to-a-border-when-building-a-grid
+
+distance.atlantic <- st_distance(inegi.edo.coste, st_cast(atlantic.shp.proj,"POLYGON")) %>% 
+  as_tibble() %>% 
+  mutate(id_row = 1:nrow(.)) 
+
+rows.coast.atlantic <- distance.atlantic %>% 
+  mutate_all(as.numeric) %>% 
+  mutate(min_dist = pmin(V1,V2,V3,V4,V5,V6)) %>% 
+  filter(min_dist<30000) %>% 
+  pull(id_row)
+
+inegi.coste.atlantic <- inegi.edo.coste %>% 
+  filter(id_row %in% rows.coast.atlantic)
+
+
+#unir comunidades atlantico y pacifico en una sola capa
+#inegi.comm.coste <- st_combine(inegi.coste.pacific, inegi.coste.atlantic)
+
+
+data.comm.pacific <- inegi.coste.pacific %>% 
+  st_drop_geometry() %>% 
+  as_tibble() 
+
+data.comm.atlantic <- inegi.coste.atlantic %>% 
+  st_drop_geometry() %>% 
+  as_tibble() 
+
+data.comm.costas.all <- data.comm.atlantic %>% 
+  bind_rows(data.comm.pacific) %>% 
+  mutate(dec_lon= (lon_deg + (lon_min / 60) + (lon_sec / 3600))*-1, 
+         dec_lat=(lat_deg + (lat_min / 60) + (lat_sec / 3600)))
+
+
+data.comm.costas <- data.comm.costas.all %>% 
+  na.omit
+
+write_csv(data.comm.costas,here("outputs","comunidades_costeras_INEGI.csv"))
+
+
+estados.shp <- st_read(paste0(here(),"/inputs/shp_files/ESTADOS.shp"))
+estados.shp.proj <- st_transform(estados.shp, crs.proj.utm)
+
+tland <- tm_shape(estados.shp.proj) + 
+  tm_fill()+
+  tm_borders()
+
+inegi.cost <- bind_rows(inegi.coste.atlantic, inegi.coste.pacific) %>% 
+  na.omit %>% 
+  dplyr::select(-"PCDISC_MOT2") # poralguna razon el nombre de esta variable causa un error
+
+inegi.cost.wgs <- st_transform(inegi.cost, crs.proj.wgs) 
+
+make_map(inegi.cost.wgs, thistitle="Total population",thisoutput="/outputs/figures/map_locs_en.png")
+
+make_map(inegi.cost.wgs, thistitle="Población total ",thisoutput="/outputs/figures/map_locs_sp.png")
+
+st_write(inegi.cost.wgs, here("outputs","shp_files","comunidades_costeras_30km.shp"), append = FALSE)
+
+```
+
+Descarga masiva de datos DENUE, Unidades economicas para todo el pais por tipo de actividad economica
+
+```{r}
+
+unidades.denue <- read_xlsx(here("inputs","sensitivity","denue","links_DENUE_descarga_masiva.xlsx"), sheet=1)
+
+links.denue <- unidades.denue %>% 
+  pull(Link)
+
+for(eachlink in links.denue){
+  
+  this.file <- str_split(eachlink,"\\/") %>% 
+    unlist %>% 
+    .[7]
+  
+  print(this.file)
+  system(paste("wget",eachlink), wait = TRUE )
+  
+   
+}
+
+zip.files <- list.files(path="/home/atlantis/vulnerabilidadbid/", pattern="*.zip")
+
+for(this.zip in zip.files){
+
+  unlink("/home/atlantis/vulnerabilidadbid/conjunto_de_datos", recursive=TRUE)
+  unlink("/home/atlantis/vulnerabilidadbid/diccionario_de_datos", recursive=TRUE)
+  unlink("/home/atlantis/vulnerabilidadbid/metadatos", recursive=TRUE)
+  
+  system(paste0("unzip ","/home/atlantis/vulnerabilidadbid/",this.zip), wait = TRUE)
+  
+  this.csv <- list.files(path="/home/atlantis/vulnerabilidadbid/conjunto_de_datos",pattern="csv")
+  
+  file.rename(from=paste0("/home/atlantis/vulnerabilidadbid/conjunto_de_datos/",this.csv),to=paste0("/home/atlantis/vulnerabilidadbid/inputs/sensitivity/denue/",this.csv))
+  
+  unlink("/home/atlantis/vulnerabilidadbid/conjunto_de_datos", recursive=TRUE)
+  unlink("/home/atlantis/vulnerabilidadbid/diccionario_de_datos", recursive=TRUE)
+  unlink("/home/atlantis/vulnerabilidadbid/metadatos", recursive=TRUE)
+
+  
+}
+
+denue.inegi <- list.files(path="/home/atlantis/vulnerabilidadbid/inputs/sensitivity/denue/", pattern="denue_inegi")
+
+get_denue  <- function(thisfile) {
+  
+   
+  thispattern <- thisfile %>% 
+    str_split("denue_inegi") %>%
+    unlist() %>% 
+    .[2] %>% 
+    str_replace(".csv","")
+ 
+  this.activity <- unidades.denue %>% 
+    filter(str_detect(Link,thispattern)) %>% 
+    pull(`Actividad económica`)
+  
+  print(this.activity)
+  print(thispattern)
+  
+  this.denue <- fread(here("inputs","sensitivity","denue",thisfile), encoding = "Latin-1") %>% 
+    as_tibble() %>% 
+     dplyr::select(cve_ent, cve_mun, cve_loc) %>% 
+  mutate(index_no=1, index = 1:nrow(.)) %>%
+  mutate_if(is.character,as.numeric) %>% 
+  mutate(COM_ID= paste(`cve_ent`,`cve_mun`,`cve_loc`, sep="_"), actividad = this.activity) %>% 
+  group_by(COM_ID, actividad) %>% 
+  summarise(neg_tot = sum(index_no))
+}
+ 
+  
+actividad.denue <- lapply(denue.inegi, get_denue) %>% 
+  bind_rows
+
+fwrite(actividad.denue,here("inputs","sensitivity","denue","actividades_denue.csv"))
+
+
+
+
+
+```
+
+
+Susceptibilidad: 
+
+Dependencia acuicola y pesquera
+
+Proporcion de unidades economicas acuicolas relativo a unidades economicas totales
+Proporcion de unidades economicas pesqueras relativo a unidades economicas totales
+Número de permisos de pesca (2016)
+Numero de unidades acuicolas*
+Número de permisos para acuacultura*
+Hectáreas de cultivo
+Producción acuícola (localidad / municipio) (2016)
+
+
+Unidades economicas
+
+```{r unidades_economicas, echo=FALSE}
+
+#comunidades con datos INEGI censo 2020
+data.comm.costas <- read_csv(here("outputs","comunidades_costeras_INEGI.csv")) %>% 
+  mutate(NOM_MUN = stri_trans_general(str = NOM_MUN, id = "Latin-ASCII")) %>% # quitar los acentos
+  mutate(NOM_ENT = stri_trans_general(str = NOM_ENT, id = "Latin-ASCII")) %>% 
+  mutate(NOM_LOC = stri_trans_general(str = NOM_LOC, id = "Latin-ASCII")) %>% 
+  mutate(NOM_MUN = tolower(NOM_MUN)) %>% 
+  mutate(NOM_ENT = tolower(NOM_ENT)) %>% 
+  mutate(NOM_LOC = tolower(NOM_LOC))
+#quitar los acentos
+#https://stackoverflow.com/questions/39148759/remove-accents-from-a-dataframe-column-in-r
+
+cost.data.pob <- read_csv(here("outputs","comunidades_costeras_INEGI.csv"))
+
+crs.proj.utm <- ("+proj=utm +zone=12 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs +datum=NAD83") 
+crs.proj.wgs <- "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"
+
+#estados de la Republica
+est.2019 <- st_read(here("inputs","datos_INEGI_2020","dest2019gw.shp"))
+
+inegi.2010 <- fread(here("inputs","datos_INEGI_2010","iter_00_cpv2010", "conjunto_de_datos","iter_00_cpv2010.csv"), encoding="Latin-1")
+
+campos <- c("aqua","pesquera","pesca","acuatica","nautica","marino","panga","acuicola","acuatico","pesquero","pesco","acuatico","nautico","marino","barco")
+
+#Indicadores
+#Proporcion de unidades economicas acuicolas relativo a unidades economicas totales
+#Proporcion de unidades economicas pesqueras relativo a unidades economicas totales
+
+actividad.denue <- fread(here("inputs","sensitivity","denue","actividades_denue.csv")) %>% 
+  group_by(COM_ID) %>% 
+  summarise(tot_ue = sum(neg_tot))
+
+denue.asociadas <- st_read(here("inputs","sensitivity","denue","INEGI_DENUE_actividades_asociadas.shp")) %>% 
+  as_tibble %>% 
+  mutate(nom_estab = str_replace_all(nom_estab,"[^[:graph:]]", " ")) %>% #remove all non-graphical characters https://stackoverflow.com/questions/9637278/r-tm-package-invalid-input-in-utf8towcs
+  mutate(nom_estab = tolower(nom_estab)) %>% 
+  filter(str_detect(nom_estab,paste(campos,collapse="|"))) %>% 
+  dplyr::select(cve_ent, cve_mun, cve_loc) %>% 
+  mutate(index_no=1, index = 1:nrow(.)) %>%
+  mutate_if(is.character,as.numeric) %>% 
+  mutate(COM_ID= paste(`cve_ent`,`cve_mun`,`cve_loc`, sep="_")) %>% 
+  group_by(COM_ID) %>% 
+  summarise(neg_pesca = sum(index_no))
+
+denue.pesqueras <- st_read(here("inputs","sensitivity","denue","INEGI_DENUE_pesqueras.shp")) %>% 
+  as_tibble %>% 
+  dplyr::select(cve_ent, cve_mun, cve_loc) %>% 
+  mutate(index_no=1, index = 1:nrow(.)) %>%
+  mutate_if(is.character,as.numeric) %>% 
+  mutate(COM_ID= paste(`cve_ent`,`cve_mun`,`cve_loc`, sep="_")) %>% 
+  bind_rows(denue.asociadas) %>% 
+  group_by(COM_ID) %>% 
+  summarise(neg_pesca = sum(index_no)) 
+
+denue.acuicolas <- st_read(here("inputs","sensitivity","denue","INEGI_DENUE_acuicolas.shp")) %>% 
+  as_tibble %>% 
+  dplyr::select(cve_ent, cve_mun, cve_loc) %>% 
+  mutate(index_no=1, index = 1:nrow(.)) %>%
+  mutate_if(is.character,as.numeric) %>% 
+  mutate(COM_ID= paste(`cve_ent`,`cve_mun`,`cve_loc`, sep="_")) %>% 
+  group_by(COM_ID) %>% 
+  summarise(neg_acuicolas = sum(index_no)) 
+
+unidades.denue <- denue.acuicolas %>% 
+  left_join(denue.pesqueras, by = "COM_ID") %>% 
+  left_join(actividad.denue, by ="COM_ID") %>% 
+  mutate_if(is.numeric, funs(ifelse(is.na(.), 0, .))) %>% 
+  mutate(prop_acuicolas = neg_acuicolas/tot_ue, prop_pesca = neg_pesca/tot_ue)
+
+inegi.cost.wgs <- st_read("~/vulnerabilidadbid/outputs/shp_files/comunidades_costeras_30km.shp") %>% 
+  dplyr::select(COM_ID,ENTIDAD,NOM_ENT,MUN,NOM_MUN,LOC,NOM_LOC, POBTOT) %>% 
+ mutate(NOM_MUN =tolower(stri_trans_general(str = NOM_MUN, id = "Latin-ASCII"))) %>% 
+  mutate(NOM_ENT =tolower(stri_trans_general(str = NOM_ENT, id = "Latin-ASCII"))) %>% 
+  mutate(NOM_LOC =tolower(stri_trans_general(str = NOM_LOC, id = "Latin-ASCII"))) 
+
+cost.unidades.denue <- inegi.cost.wgs %>% 
+  as_tibble %>% 
+  left_join(unidades.denue, by=c("COM_ID")) %>% 
+  mutate_all(~replace(., is.na(.), 0)) %>% 
+  mutate(neg_acui_per_capita = if_else(neg_acuicolas>0, (neg_acuicolas/POBTOT), 0),
+        neg_pesca_per_capita = if_else(neg_pesca>0, (neg_pesca/POBTOT), 0)) %>% 
+  dplyr::select(-geometry)
+
+
+cost.unidades.denue %>% write_csv(here("inputs","sensitivity","data_summary","indice_unidades_economicas.csv"))
+
+
+file.create(here("inputs","sensitivity","data_summary","metadata_indice_unidades_economicas.txt"))  
+cat("Datos Directorio Estadístico Nacional de Unidades Económicas DENUE (https://www.inegi.org.mx/app/mapa/denue/default.aspx) \n",file=here("inputs","sensitivity","data_summary","metadata_indice_unidades_economicas.txt"), append = TRUE)
+cat("Datos actualizados a Mayo 2021 \n",file=here("inputs","sensitivity","data_summary","metadata_indice_unidades_economicas.txt"), append = TRUE)
+
+
+
+  
+```
+
+Susceptibilidad
+Analisis de numero de permisos de pesca 
+
+```{r permisos_acuicola_pesca, include=FALSE}
+
+#comunidades con datos INEGI censo 2020
+data.comm.costas <- read_csv(here("outputs","comunidades_costeras_INEGI.csv")) %>% 
+  mutate(NOM_MUN = stri_trans_general(str = NOM_MUN, id = "Latin-ASCII")) %>% # quitar los acentos
+  mutate(NOM_ENT = stri_trans_general(str = NOM_ENT, id = "Latin-ASCII")) %>% 
+  mutate(NOM_LOC = stri_trans_general(str = NOM_LOC, id = "Latin-ASCII")) %>% 
+  mutate(NOM_MUN = tolower(NOM_MUN)) %>% 
+  mutate(NOM_ENT = tolower(NOM_ENT)) %>% 
+  mutate(NOM_LOC = tolower(NOM_LOC))
+
+
+#Número de permisos de pesca (2016)
+
+cost.data.pob <- read_csv(here("outputs","comunidades_costeras_INEGI.csv")) %>% 
+  mutate(NOM_MUN = tolower(NOM_MUN)) %>% 
+  mutate(NOM_ENT = tolower(NOM_ENT)) %>% 
+  mutate(NOM_LOC = tolower(NOM_LOC))
+
+num.permisos.pesca.pac <- read_xlsx(here("inputs","sensitivity","permisos_pesca_comercial.xlsx"), sheet = 1) %>% 
+  mutate(COM_MUN= paste(ID_ESTADO,ID_MUNICIPIO,sep="_")) %>% 
+  mutate(index_no=1) %>% 
+  group_by(COM_MUN) %>% 
+  summarise(num_permisos_pesca_mun = sum(index_no)) 
+
+num.permisos.pesca.gom.may <- read_xlsx(here("inputs","sensitivity","GOM-permisos_pesca-2016-2018.xlsx"), sheet = 1) %>% 
+  dplyr::select(ESTADO,`1. ENTIDAD (LOCALIDAD)`) %>% 
+  mutate(COM_MUN= paste(ESTADO,`1. ENTIDAD (LOCALIDAD)`,sep="_")) %>% 
+  mutate(index_no=1) %>% 
+  group_by(COM_MUN) %>% 
+  summarise(num_permisos_pesca_mun = sum(index_no)) %>% 
+  separate("COM_MUN",c("ESTADO","LOC"),"_") %>% 
+  mutate(NOM_ENT=tolower(ESTADO),NOM_LOC=tolower(LOC)) %>% 
+  mutate(NOM_ENT=trimws(NOM_ENT)) %>% 
+  dplyr::select(-ESTADO, - LOC) %>% 
+  left_join(data.comm.costas, c("NOM_LOC","NOM_ENT")) %>% 
+  mutate(COM_MUN= paste(ENTIDAD,MUN,sep="_")) %>% 
+  group_by(COM_MUN) %>% 
+  summarise(num_permisos_pesca_mun = sum(num_permisos_pesca_mun))
+  
+num.permisos.pesca.gom.men <- read_xlsx(here("inputs","sensitivity","GOM-permisos_pesca-2016-2018.xlsx"), sheet = 1) %>% 
+  dplyr::select(ESTADO,`1. ENTIDAD (LOCALIDAD)`) %>% 
+  mutate(COM_MUN= paste(ESTADO,`1. ENTIDAD (LOCALIDAD)`,sep="_")) %>% 
+  mutate(index_no=1) %>% 
+  group_by(COM_MUN) %>% 
+  summarise(num_permisos_pesca_mun = sum(index_no)) %>% 
+  separate("COM_MUN",c("ESTADO","LOC"),"_") %>% 
+  mutate(NOM_ENT=tolower(ESTADO),NOM_LOC=tolower(LOC)) %>% 
+  mutate(NOM_ENT=trimws(NOM_ENT)) %>% 
+  dplyr::select(-ESTADO, - LOC) %>% 
+  left_join(data.comm.costas, c("NOM_LOC","NOM_ENT")) %>% 
+   mutate(COM_MUN= paste(ENTIDAD,MUN,sep="_")) %>% 
+  group_by(COM_MUN) %>% 
+  summarise(num_permisos_pesca_mun = sum(num_permisos_pesca_mun))
+  
+permisos.pesca <- bind_rows(num.permisos.pesca.gom.men,num.permisos.pesca.gom.may,num.permisos.pesca.pac) %>% 
+  group_by(COM_MUN) %>% 
+  summarise(num_permisos_pesca_mun = sum(num_permisos_pesca_mun))
+  
+permisos.pesca.mun <- data.comm.costas %>% 
+   mutate(COM_MUN= paste(ENTIDAD,MUN,sep="_")) %>% 
+   group_by(COM_MUN) %>% 
+   summarise(tot_pob_mun = sum(POBTOT)) %>% 
+   left_join(permisos.pesca, by="COM_MUN") %>% 
+   mutate_if(is.numeric, funs(ifelse(is.na(.), 0, .))) %>% 
+  mutate(permisos_pesca_per_capita_mun = num_permisos_pesca_mun / tot_pob_mun) #permisos per capita
+
+#Número de permisos para acuacultura*
+
+num.permisos.acuicolas <- read_xlsx(here("inputs","sensitivity","permisos_acuicolas.xlsx"), sheet = 1, skip = 1) %>% 
+  mutate(municipio=tolower(Municipio), estado = tolower(Estado)) %>% 
+  mutate(edo_mun = paste0(estado,"_",municipio)) %>% 
+  mutate(index_no=1) %>%
+  group_by(edo_mun) %>% 
+  summarise(num_permisos_acuicolas = sum(index_no)) %>% 
+  separate(edo_mun,c("estado","municipio"), sep="_")
+
+permisos.acu.mun <- data.comm.costas %>% 
+   mutate(COM_MUN= paste(ENTIDAD,MUN,sep="_")) %>% 
+   group_by(COM_MUN, NOM_ENT, NOM_MUN) %>% 
+   summarise(tot_pob_mun = sum(POBTOT)) %>% 
+   ungroup %>% 
+   mutate(municipio=tolower(NOM_MUN), estado = tolower(NOM_ENT)) %>% 
+   left_join(num.permisos.acuicolas, by=c("estado","municipio")) %>% 
+   mutate_if(is.numeric, funs(ifelse(is.na(.), 0, .))) %>% 
+  mutate(permisos_acui_per_capita_mun = num_permisos_acuicolas / tot_pob_mun)
+
+permisos.mun <- permisos.pesca.mun %>% 
+  left_join(permisos.acu.mun, by=c("COM_MUN","tot_pob_mun")) %>% 
+  dplyr::select(-NOM_ENT, -NOM_MUN,-municipio, -estado) %>% 
+   mutate_if(is.numeric, funs(ifelse(is.na(.), 0, .)))
+ 
+permisos.prob <- cost.data.pob %>% 
+  mutate(COM_MUN = paste(ENTIDAD,MUN,sep="_")) %>% 
+  dplyr::select(COM_MUN, NOM_ENT, NOM_MUN, COM_ID, NOM_LOC) %>% 
+  mutate(NOM_ENT =stri_trans_general(str = NOM_ENT, id = "Latin-ASCII")) %>% 
+  mutate(NOM_MUN =stri_trans_general(str = NOM_MUN, id = "Latin-ASCII")) %>% 
+  mutate(NOM_LOC =stri_trans_general(str = NOM_LOC, id = "Latin-ASCII")) %>% 
+  left_join(permisos.mun, by="COM_MUN") 
+
+inegi.cost.wgs <- st_read("~/vulnerabilidadbid/outputs/shp_files/comunidades_costeras_30km.shp") %>% 
+  dplyr::select(COM_ID,ENTIDAD,NOM_ENT,MUN,NOM_MUN,LOC,NOM_LOC, POBTOT) %>% 
+ mutate(NOM_MUN =tolower(stri_trans_general(str = NOM_MUN, id = "Latin-ASCII"))) %>% 
+  mutate(NOM_ENT =tolower(stri_trans_general(str = NOM_ENT, id = "Latin-ASCII"))) %>% 
+  mutate(NOM_LOC =tolower(stri_trans_general(str = NOM_LOC, id = "Latin-ASCII"))) 
+
+cost.permisos <- inegi.cost.wgs %>% 
+  as_tibble %>% 
+  left_join(permisos.prob, by=c("COM_ID","NOM_ENT","NOM_MUN","NOM_LOC")) %>% 
+  mutate_all(~replace(., is.na(.), 0)) %>% 
+  dplyr::select(-geometry)
+
+cost.permisos %>% write_csv(here("inputs","sensitivity","data_summary","indice_permisos_pesca_acuicolas.csv"))
+
+file.create(here("inputs","sensitivity","data_summary","metadata_indice_permisos_pesca_acuicolas.txt"))  
+cat("Comisión Nacional de Acuacultura y Pesca CONAPESCA (https://datos.gob.mx/busca/dataset/permisos-y-concesiones-de-pesca-comercial-para-embarcaciones-mayores-y-menores)
+ \n",file=here("inputs","sensitivity","data_summary","metadata_indice_permisos_pesca_acuicolas.txt"), append = TRUE)
+cat("Datos actualizados a Diciembre 2018 permisos pesca y 2020 acuicolas \n",file=here("inputs","sensitivity","data_summary","metadata_indice_permisos_pesca_acuicolas.txt"), append = TRUE)
+
+```
+
+Susceptibilidad
+Produccion acuicola
+
+```{r produccion_acuicola_pesquera, echo=FALSE}
+
+#Susceptibilidad
+
+#municipios
+
+municipios.shp <- st_read(paste0(here(),"/inputs/shp_files/mun20gw.shp")) %>% 
+  dplyr::select(CVE_ENT, NOM_ENT, CVE_MUN, NOM_MUN)
+
+crs.proj.wgs <- "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"
+
+
+#buffer de 10 km por localidad
+
+inegi.cost.wgs <- st_read("~/vulnerabilidadbid/outputs/shp_files/comunidades_costeras_30km.shp") %>% 
+  dplyr::select(COM_ID,ENTIDAD,NOM_ENT,MUN,NOM_MUN,LOC,NOM_LOC, POBTOT)
+
+pob.mun.costeros <- inegi.cost.wgs %>% 
+  as_tibble %>% 
+  dplyr::select(COM_ID,ENTIDAD,NOM_ENT,MUN,NOM_MUN,LOC,NOM_LOC, POBTOT) %>% 
+  mutate(COM_MUN = paste(ENTIDAD,MUN,sep="_")) %>% 
+  group_by(NOM_ENT,ENTIDAD,MUN, NOM_MUN, COM_MUN) %>% 
+  summarise(pob_mun = sum(POBTOT)) %>% 
+  mutate(NOM_ENT =tolower(stri_trans_general(str = `NOM_ENT`, id = "Latin-ASCII"))) %>% 
+  mutate(NOM_MUN =tolower(stri_trans_general(str = `NOM_MUN`, id = "Latin-ASCII")))
+
+cost.wgs <- inegi.cost.wgs %>% st_set_crs(crs.proj.wgs) 
+
+crs.proj.utm <- ("+proj=utm +zone=12 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs +datum=NAD83") 
+
+cost.utm <- st_transform(cost.wgs, crs.proj.utm)
+
+cost.utm.buff <- st_buffer(cost.utm, dist=10000)
+
+#Producción acuícola y pesquera (localidad / municipio) (2016)
+#Extraer sitios de desembarque
+
+#Golfo de Mexico
+produccion.gom <- read_xlsx(here("inputs","sensitivity","GOM-Produccion pesquera y acuicola-2016-2018.xlsx")) 
+
+produccion.gom.rev <- produccion.gom %>% 
+  dplyr::select(`NOMBRE SITIO DESEMBARQUE`, `NOMBRE ESTADO`, `CLAVE ESPECIE`, `NOMBRE PRINCIPAL`, `PESO DESEMBARCADO (KILOGRAMOS)`, `PRECIO (PESOS)`) %>% 
+  mutate(`NOMBRE SITIO DESEMBARQUE`=gsub("PUERTOABGO","PUERTO DE ABRIGO",`NOMBRE SITIO DESEMBARQUE`)) %>% 
+  mutate(`NOMBRE SITIO DESEMBARQUE`=gsub("PUERTO ABRIGO","PUERTO DE ABRIGO",`NOMBRE SITIO DESEMBARQUE`)) %>% 
+  mutate(`NOMBRE SITIO DESEMBARQUE`=gsub("^EJ[.]","EJIDO",`NOMBRE SITIO DESEMBARQUE`)) %>% 
+  mutate(`NOMBRE SITIO DESEMBARQUE`=gsub("NÂ°","No ",`NOMBRE SITIO DESEMBARQUE`)) %>% 
+  mutate(`NOMBRE SITIO DESEMBARQUE`=gsub("NVO","NUEVO",`NOMBRE SITIO DESEMBARQUE`)) %>% 
+  mutate(`NOMBRE SITIO DESEMBARQUE`=gsub("^EJ ","EJIDO ",`NOMBRE SITIO DESEMBARQUE`))%>% 
+  mutate(`NOMBRE SITIO DESEMBARQUE`=gsub("^E[.]","EJIDO ",`NOMBRE SITIO DESEMBARQUE`))%>% 
+  mutate(`NOMBRE SITIO DESEMBARQUE`=gsub("^EJID ","EJIDO",`NOMBRE SITIO DESEMBARQUE`)) %>% 
+  mutate(`NOMBRE SITIO DESEMBARQUE`=gsub("^POB[.]","POBLADO ",`NOMBRE SITIO DESEMBARQUE`)) %>% 
+  mutate(`NOMBRE SITIO DESEMBARQUE`=gsub("^CONG[.]","CONGREGACION ",`NOMBRE SITIO DESEMBARQUE`)) %>% 
+  mutate(`NOMBRE SITIO DESEMBARQUE`=gsub("^COL[.]","COLONIA ",`NOMBRE SITIO DESEMBARQUE`)) %>% 
+  mutate(`NOMBRE SITIO DESEMBARQUE`=gsub("^CAMP[.] PESQ[.]","CAMPO PESQUERO",`NOMBRE SITIO DESEMBARQUE`)) %>% 
+  mutate(`NOMBRE SITIO DESEMBARQUE`=gsub("^PTO ","PUERTO",`NOMBRE SITIO DESEMBARQUE`)) %>% 
+  mutate(`NOMBRE SITIO DESEMBARQUE`=gsub("^RA ","RANCHERIA",`NOMBRE SITIO DESEMBARQUE`)) %>%
+  mutate(`NOMBRE SITIO DESEMBARQUE` = if_else(`NOMBRE SITIO DESEMBARQUE`=="VERACRUZ, PUERTO","PUERTO DE VERACRUZ", `NOMBRE SITIO DESEMBARQUE`)) %>% 
+  mutate(`NOMBRE SITIO DESEMBARQUE`=gsub("[..]","",`NOMBRE SITIO DESEMBARQUE`)) %>% 
+  mutate(`NOMBRE SITIO DESEMBARQUE`=gsub("CD DEL","CIUDAD DEL",`NOMBRE SITIO DESEMBARQUE`)) %>% 
+  mutate(`NOMBRE SITIO DESEMBARQUE`=gsub("[%]","Ñ",`NOMBRE SITIO DESEMBARQUE`)) %>% 
+  mutate(`NOMBRE SITIO DESEMBARQUE`=gsub("[,]TAB","",`NOMBRE SITIO DESEMBARQUE`)) %>% 
+  mutate(`NOMBRE SITIO DESEMBARQUE`=gsub("MALECOM","MALECON",`NOMBRE SITIO DESEMBARQUE`)) %>% 
+  mutate(`NOMBRE SITIO DESEMBARQUE` = str_squish(`NOMBRE SITIO DESEMBARQUE`))
+
+
+# Georefercenciar sitios de desembarque
+
+# sitios.gom.geo <- produccion.gom.rev %>% 
+#   distinct(`NOMBRE ESTADO`,`NOMBRE SITIO DESEMBARQUE`) %>% 
+#   arrange(`NOMBRE ESTADO`,`NOMBRE SITIO DESEMBARQUE`) %>% 
+#   mutate(country = "MEXICO") %>% 
+#   geocode(., city=`NOMBRE SITIO DESEMBARQUE`, state=`NOMBRE ESTADO`,country=country, return_input = FALSE, verbose = TRUE) 
+# 
+# #no todos los sitios se georreferenciaron, revisar manualmente
+# sitios.gom.geo %>% write_csv(here("inputs","sensitivity","sitios_desembarque_GOM.csv"))
+
+
+#revision manual de sitios
+loc.gom.rev <- read_xlsx(here("inputs","sensitivity","Coordenadas desembarque GOM-PACIF.xlsx"), sheet = "GOM") %>% 
+  mutate(LOCALIDAD =tolower(stri_trans_general(str = city, id = "Latin-ASCII"))) %>% 
+  mutate(ESTADO =tolower(stri_trans_general(str = state, id = "Latin-ASCII"))) %>% 
+  mutate(LOCALIDAD = gsub("[.]","", LOCALIDAD)) %>% 
+  mutate(lat_rev = as.numeric(lat)) %>% 
+  mutate(long_rev = as.numeric(long)) %>% 
+  dplyr::select(-lat,-long) %>% 
+  distinct(LOCALIDAD, ESTADO, lat_rev, long_rev) %>% 
+  mutate(LOCALIDAD=if_else(LOCALIDAD=="cano lagarto","caño lagarto",LOCALIDAD)) %>% 
+  mutate(LOCALIDAD = str_squish(LOCALIDAD))
+
+#revisar duplicados
+#loc.gom.rev %>% group_by(LOCALIDAD, ESTADO) %>% count() %>% filter(n > 1)
+
+#contar localidades no georeferenciadas
+#loc.gom.rev %>% filter(is.na(lat_rev))
+
+prod.tot <- produccion.gom.rev %>% 
+   mutate(LOCALIDAD =tolower(stri_trans_general(str = `NOMBRE SITIO DESEMBARQUE`, id = "Latin-ASCII"))) %>% 
+   mutate(ESTADO =tolower(stri_trans_general(str = `NOMBRE ESTADO`, id = "Latin-ASCII"))) %>% 
+  mutate(LOCALIDAD = gsub("[.]","", LOCALIDAD)) %>% 
+  mutate(valor_captura = (`PRECIO (PESOS)`*`PESO DESEMBARCADO (KILOGRAMOS)`)/1000) %>% 
+  group_by(ESTADO, LOCALIDAD) %>% 
+  summarise(tot_mt = sum(`PESO DESEMBARCADO (KILOGRAMOS)` / 1000), tot_valor = sum(valor_captura)) %>% 
+  mutate(LOCALIDAD = if_else(LOCALIDAD == "cano lagarto", "caño lagarto", LOCALIDAD))
+
+georef.gom <- prod.tot %>%  
+  left_join(loc.gom.rev, by=c("ESTADO","LOCALIDAD")) %>% 
+  na.omit
+
+loc.gom.sf <- georef.gom %>%
+  st_as_sf(
+    coords = c("long_rev", "lat_rev"),
+    agr = "constant",
+    crs = crs.proj.wgs,
+    stringsAsFactors = FALSE,
+    remove = TRUE
+    )
+
+loc.gom.mun <- st_join(loc.gom.sf, municipios.shp, join = st_within) 
+
+#usar para checar datos
+#sitios.gom.geo %>% arrange(`NOMBRE SITIO DESEMBARQUE`) %>% pull(`NOMBRE SITIO DESEMBARQUE`)
+
+loc.gom.mun.utm <- st_transform(loc.gom.mun, crs.proj.utm)
+
+#produccion pacifico
+#ambarcaciones mayores
+produccion.pac.mayores <- read_xlsx(here("inputs","sensitivity","Pacifico-Produccion pesquera embarcaciones mayores 2016.xlsx")) 
+
+produccion.pac.mayor.rev <- produccion.pac.mayores %>% 
+  dplyr::select("PUERTO DE ARRIBO", "ENTIDAD", "ESPECIE", "PESO DESEMBARCADO\r\n (Kg)","PRECIO\r\nCAPTURA") %>% 
+  mutate(`PUERTO DE ARRIBO` = toupper(`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("Ã‘","Ñ",`PUERTO DE ARRIBO`)) 
+
+# sitios.pac.may.geo <- produccion.pac.mayor.rev %>% 
+#   distinct(ENTIDAD, `PUERTO DE ARRIBO`) %>% 
+#   arrange(ENTIDAD, `PUERTO DE ARRIBO`) %>% 
+#   mutate(country = "MEXICO") %>% 
+#   geocode(., city=`PUERTO DE ARRIBO`, state=ENTIDAD,country=country, return_input = FALSE, verbose = TRUE) 
+#  
+# sitios.pac.may.geo %>% write_csv(here("inputs","sensitivity","sitios_desembarque_pac_mayores.csv"))
+
+sitios.pac.may.geo <- read_csv(here("inputs","sensitivity","sitios_desembarque_pac_mayores_rev.csv")) %>% 
+  mutate(LOCALIDAD =tolower(stri_trans_general(str = city, id = "Latin-ASCII"))) %>% 
+  mutate(ESTADO =tolower(stri_trans_general(str = state, id = "Latin-ASCII"))) %>% 
+  dplyr::select(-city, -state)
+
+
+prod.tot <- produccion.pac.mayor.rev %>% 
+   mutate(LOCALIDAD =tolower(stri_trans_general(str = `PUERTO DE ARRIBO`, id = "Latin-ASCII"))) %>% 
+   mutate(ESTADO =tolower(stri_trans_general(str = `ENTIDAD`, id = "Latin-ASCII"))) %>% 
+  mutate(LOCALIDAD = gsub("[.]","", LOCALIDAD)) %>% 
+  mutate(valor_captura = (`PRECIO\r\nCAPTURA`*`PESO DESEMBARCADO\r\n (Kg)`)/1000) %>% 
+  group_by(ESTADO, LOCALIDAD) %>% 
+  summarise(tot_mt = sum(`PESO DESEMBARCADO\r\n (Kg)` / 1000), tot_valor = sum(valor_captura)) 
+
+georef.pac.may <- prod.tot %>%  
+  left_join(sitios.pac.may.geo, by=c("ESTADO","LOCALIDAD")) %>% 
+  filter(!is.na(lat)) %>% 
+  dplyr::select(-country)
+
+loc.pac.may.sf <- georef.pac.may %>%
+  st_as_sf(
+    coords = c("long", "lat"),
+    agr = "constant",
+    crs = crs.proj.wgs,
+    stringsAsFactors = FALSE,
+    remove = TRUE
+    )
+
+loc.pac.may.mun <- st_join(loc.pac.may.sf, municipios.shp, join = st_within) 
+
+#usar para checar datos
+#sitios.gom.geo %>% arrange(`NOMBRE SITIO DESEMBARQUE`) %>% pull(`NOMBRE SITIO DESEMBARQUE`)
+
+loc.pac.may.mun.utm <- st_transform(loc.pac.may.mun, crs.proj.utm)
+
+
+
+#embarcaciones menores
+
+produccion.pac.men <- read_xlsx(here("inputs","sensitivity","Pacifico-Produccion pesquera embarcaciones menores 2016.xlsx")) 
+
+produccion.pac.men.rev <- produccion.pac.men %>% 
+  dplyr::select("PUERTO DE ARRIBO", "ENTIDAD", "ESPECIE", "PESO DESEMBARCADO\r\n (Kg)", "PRECIO\r\nCAPTURA") %>% 
+  mutate(`PUERTO DE ARRIBO` = toupper(`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("B[.]C[.]N[.]","",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("GRO.","",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("\\(B[.]C[.]S[.]\\)","",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("\\(EN B[.]C[.]N[.]\\)","",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("\\(PTO[.]ESC[.]\\)","PUERTO ESCONDIDO",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("\\(B[.] DE LOS ANGELES\\)","PUERTO ESCONDIDO",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("CULT[.]","CULTIVO",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("\\(CULT\\)","CULTIVO",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("PUENTE, EL","EL PUENTE",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("CORTINA[,] LA","LA CORTINA",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("CHIRIMOYO[,] EL","EL CHIRIMOYO",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("BORDO[,] EL","EL BORDO",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("PUENTE[,] EL","EL PUENTE",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("CRUZ DE HUANACAXTLE[,] LA","LA CRUZ DE HUANACAXTLE",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("NOPALERA, LA","LA NOPALERA",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("CANTON[,] EL","EL CANTON",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("CONCHAL[,] EL","EL CONCHAL",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("MATITA[,] LA","LA MATITA",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("PLATANO[,] EL","EL PLATANO",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("ESPINO[,] EL","EL ESPINO",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("MORILLOS, LOS","EL ESPINO",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("CUACOYOTL, EL","EL ESPINO",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("CONCHAS, LAS","EL ESPINO",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("ROBLITO, EL","EL ESPINO",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("OTATITO, EL","EL ESPINO",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("RAMPA[,] LA","LA RAMPA",`PUERTO DE ARRIBO`)) %>%
+  mutate(`PUERTO DE ARRIBO`=gsub("MULAS[,] LAS","LAS MULAS",`PUERTO DE ARRIBO`)) %>%
+  mutate(`PUERTO DE ARRIBO`=gsub("ESCOLLERA[,] LA","LA ESCOLLERA",`PUERTO DE ARRIBO`)) %>%
+  mutate(`PUERTO DE ARRIBO`=gsub("RINCON[,] EL","EL RINCON",`PUERTO DE ARRIBO`)) %>%
+  mutate(`PUERTO DE ARRIBO`=gsub("CHAGUIN[,] EL","CHAGUIN",`PUERTO DE ARRIBO`)) %>%
+  mutate(`PUERTO DE ARRIBO`=gsub("RUBEÑA[,] LA","RUBEÑA",`PUERTO DE ARRIBO`)) %>%
+  mutate(`PUERTO DE ARRIBO`=gsub("CALIXTRA[,] LA","LA CALIXTRA",`PUERTO DE ARRIBO`)) %>%
+  mutate(`PUERTO DE ARRIBO`=gsub("COLOMO[,] EL","EL COLOMO",`PUERTO DE ARRIBO`)) %>%
+  mutate(`PUERTO DE ARRIBO`=gsub("PENITA[,] LA","LA PENITA",`PUERTO DE ARRIBO`)) %>%
+  mutate(`PUERTO DE ARRIBO`=gsub("ERDON[,] EL","EL ERDON",`PUERTO DE ARRIBO`)) %>%
+  mutate(`PUERTO DE ARRIBO`=gsub("RANCHITO[,] EL","EL RANCHITO",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("VALLE DE LA URRACA[,] EL","VALLE DE LA URRACA",`PUERTO DE ARRIBO`)) %>%
+  mutate(`PUERTO DE ARRIBO`=gsub("PALAPITA[,] LA","LA PALAPITA",`PUERTO DE ARRIBO`)) %>%
+  mutate(`PUERTO DE ARRIBO`=gsub("GUASIMA[,] LA","LA GUASIMA",`PUERTO DE ARRIBO`)) %>%
+  mutate(`PUERTO DE ARRIBO`=gsub("BANQUITO[,] EL","EL BANQUITO",`PUERTO DE ARRIBO`)) %>%
+  mutate(`PUERTO DE ARRIBO`=gsub("B[.]C[.]S[.]","",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("FCO[.]","FRANCISCO",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("P[.] NUEVO","PUERTO NUEVO",`PUERTO DE ARRIBO`)) %>% 
+  mutate(`PUERTO DE ARRIBO`=gsub("STO[.]","SANTO",`PUERTO DE ARRIBO`))
+
+#corre el geolocalizador
+
+# sitios.pac.men.geo <- produccion.pac.men.rev %>% 
+#   distinct(ENTIDAD, `PUERTO DE ARRIBO`) %>% 
+#   arrange(ENTIDAD, `PUERTO DE ARRIBO`) %>% 
+#   mutate(country = "MEXICO") %>% 
+#   geocode(., city=`PUERTO DE ARRIBO`, state=ENTIDAD,country=country, return_input = FALSE, verbose = TRUE) 
+# 
+# 
+# sitios.pac.men.geo %>%
+#   arrange(state,city,country) %>% 
+#   write_csv(here("inputs","sensitivity","sitios_desembarque_pac_men.csv"))
+# 
+sitios.pac.men.geo  <- read_csv(here("inputs","sensitivity","sitios_desembarque_pac_men.csv")) %>% 
+  mutate(LOCALIDAD =tolower(stri_trans_general(str = city, id = "Latin-ASCII"))) %>% 
+  mutate(ESTADO =tolower(stri_trans_general(str = state, id = "Latin-ASCII"))) %>% 
+  dplyr::select(-city, -state) %>% 
+  mutate(LOCALIDAD = str_squish(LOCALIDAD))
+
+
+#'localidades del Pacifico, del Atlas de Ramirez et al.
+
+atlas.locs  <- st_read(here("inputs","shp_files","atlas_localidades_pesqueras_pac.shp")) 
+
+loc.pesq.pac <- atlas.locs %>% 
+  as.tibble %>% 
+  mutate(LOCALIDAD =tolower(stri_trans_general(str = LOCALIDAD, id = "Latin-ASCII"))) %>% 
+   mutate(ESTADO =tolower(stri_trans_general(str = ESTADO, id = "Latin-ASCII"))) %>% 
+  dplyr::select(-geometry)
+
+write_csv(loc.pesq.pac, here("inputs","localidades_Atlas_Pacifico_Ramirez.csv"))
+
+#archivo localidades pesqueras revisado manualmente
+loc.pac.rev <- read_xlsx(here("inputs","sensitivity","Coordenadas desembarque GOM-PACIF.xlsx"), sheet = 1) %>% 
+   mutate(LOCALIDAD =tolower(stri_trans_general(str = city, id = "Latin-ASCII"))) %>% 
+   mutate(ESTADO =tolower(stri_trans_general(str = state, id = "Latin-ASCII"))) %>% 
+  mutate(lat_rev = as.numeric(lat)) %>% 
+  mutate(long_rev = as.numeric(long)) %>% 
+  dplyr::select(-lat,-long) %>% 
+  mutate(LOCALIDAD = str_squish(LOCALIDAD))
+
+
+sitios.pac.men  <- sitios.pac.men.geo %>% 
+  left_join(loc.pesq.pac, by=c("ESTADO","LOCALIDAD")) %>% 
+  mutate(lat = if_else(!is.na(LATITUD),LATITUD,lat)) %>% 
+  mutate(long = if_else(!is.na(LONGITUD),LONGITUD,long)) %>% 
+  left_join(loc.pac.rev,by=c("ESTADO","LOCALIDAD", "country")) %>% 
+   mutate(lat = if_else(is.na(lat),lat_rev,lat)) %>% 
+  mutate(long = if_else(is.na(long),long_rev,long)) %>% 
+  dplyr::select(LOCALIDAD, ESTADO, lat, long) %>% 
+    mutate(LOCALIDAD = str_squish(LOCALIDAD)) %>% 
+    mutate(ESTADO = str_squish(ESTADO))
+
+prod.tot <- produccion.pac.men.rev %>% 
+  mutate(LOCALIDAD =tolower(stri_trans_general(str = `PUERTO DE ARRIBO`, id = "Latin-ASCII"))) %>% 
+  mutate(ESTADO =tolower(stri_trans_general(str = `ENTIDAD`, id = "Latin-ASCII"))) %>% 
+  mutate(valor_captura = (`PRECIO\r\nCAPTURA`*`PESO DESEMBARCADO\r\n (Kg)`)/1000) %>% 
+  group_by(ESTADO, LOCALIDAD) %>% 
+  summarise(tot_mt = sum(`PESO DESEMBARCADO\r\n (Kg)` / 1000), tot_valor = sum(valor_captura)) %>% 
+  mutate(LOCALIDAD = str_squish(LOCALIDAD)) %>% 
+  mutate(ESTADO = str_squish(ESTADO))
+
+georef.pac.men <- sitios.pac.men %>%  
+  left_join(prod.tot, by=c("ESTADO","LOCALIDAD")) %>% 
+  filter(!is.na(lat)) 
+
+loc.pac.men.sf <- georef.pac.men %>%
+  st_as_sf(
+    coords = c("long", "lat"),
+    agr = "constant",
+    crs = crs.proj.wgs,
+    stringsAsFactors = FALSE,
+    remove = TRUE
+    )
+
+loc.pac.men.mun <- st_join(loc.pac.men.sf, municipios.shp, join = st_within) 
+
+#usar para checar datos
+#sitios.gom.geo %>% arrange(`NOMBRE SITIO DESEMBARQUE`) %>% pull(`NOMBRE SITIO DESEMBARQUE`)
+
+loc.pac.men.mun.utm <- st_transform(loc.pac.men.mun, crs.proj.utm)
+
+#agregar todos los sitios
+
+#municipio
+
+pob.mun <- read_csv(here("outputs","comunidades_costeras_INEGI.csv")) %>% 
+    mutate(COM_MUN= paste(as.numeric(ENTIDAD),as.numeric(MUN), sep="_")) %>% 
+   group_by(COM_MUN) %>%
+  summarise(pob_mun = sum(POBTOT))
+
+ cost.prod.mun <- bind_rows(loc.pac.men.mun.utm,loc.pac.may.mun.utm, loc.gom.mun.utm) %>% 
+  as_tibble %>% 
+  na.omit %>% 
+  group_by(CVE_ENT, NOM_ENT, CVE_MUN, NOM_MUN) %>% 
+  summarise(tot_captura_mun = sum(tot_mt), tot_valor_mun = sum(tot_valor)) %>% 
+  mutate(COM_MUN= paste(as.numeric(CVE_ENT),as.numeric(CVE_MUN), sep="_")) %>% 
+  mutate(NOM_ENT =tolower(stri_trans_general(str = NOM_ENT, id = "Latin-ASCII"))) %>% 
+  mutate(NOM_MUN =tolower(stri_trans_general(str = NOM_MUN, id = "Latin-ASCII"))) %>%
+  mutate(COM_MUN= paste(as.numeric(CVE_ENT),as.numeric(CVE_MUN), sep="_")) %>% 
+  left_join(pob.mun, by="COM_MUN") %>% 
+  na.omit %>% 
+  mutate(tot_captura_mun_per_capita = tot_captura_mun / pob_mun)
+
+#localidad
+prod.loc.sf <- bind_rows(loc.pac.may.sf, loc.pac.men.sf, loc.gom.sf) 
+
+prod.loc.sf.utm <- st_transform(prod.loc.sf, crs.proj.utm)
+
+prod.loc.buff <- st_join(prod.loc.sf.utm, cost.utm.buff, join = st_within) 
+
+cost.prod.loc <- prod.loc.buff %>% 
+  as_tibble %>% 
+  distinct(COM_ID,ENTIDAD,NOM_ENT,MUN,NOM_MUN,LOC,NOM_LOC,POBTOT, ESTADO,LOCALIDAD,tot_mt,tot_valor) %>% 
+  mutate_all(~replace(., is.na(.), 0)) %>% 
+  group_by(NOM_ENT,NOM_MUN,NOM_LOC,ENTIDAD,MUN,LOC,COM_ID) %>% 
+  summarise(tot_captura_loc = sum(tot_mt), tot_valor_loc = sum(tot_valor)) %>% 
+  mutate(NOM_MUN =tolower(stri_trans_general(str = NOM_MUN, id = "Latin-ASCII"))) %>% 
+  mutate(NOM_ENT =tolower(stri_trans_general(str = NOM_ENT, id = "Latin-ASCII"))) %>% 
+  mutate(NOM_LOC =tolower(stri_trans_general(str = NOM_LOC, id = "Latin-ASCII"))) 
+
+
+inegi.cost.wgs <- st_read("~/vulnerabilidadbid/outputs/shp_files/comunidades_costeras_30km.shp") %>% 
+  as_tibble %>% 
+  dplyr::select(COM_ID,ENTIDAD,NOM_ENT,MUN,NOM_MUN,LOC,NOM_LOC, POBTOT) %>% 
+ mutate(NOM_MUN =tolower(stri_trans_general(str = NOM_MUN, id = "Latin-ASCII"))) %>% 
+  mutate(NOM_ENT =tolower(stri_trans_general(str = NOM_ENT, id = "Latin-ASCII"))) %>% 
+  mutate(NOM_LOC =tolower(stri_trans_general(str = NOM_LOC, id = "Latin-ASCII"))) 
+
+cost.prod.all <- inegi.cost.wgs %>% 
+  left_join(cost.prod.loc, by=c("COM_ID","NOM_ENT","NOM_MUN","NOM_LOC","ENTIDAD","MUN","LOC")) %>% 
+  left_join(cost.prod.mun, by=c("NOM_ENT","NOM_MUN")) %>% 
+  mutate_all(~replace(., is.na(.), 0)) %>% 
+  mutate(tot_captura_loc_per_capita = tot_captura_loc / POBTOT) %>% 
+  dplyr::select(-CVE_ENT, CVE_MUN)
+
+cost.prod.all %>% write_csv(here("inputs","sensitivity","data_summary","indice_produccion_pesquera.csv"))
+
+file.create(here("inputs","sensitivity","data_summary","metadata_indice_produccion_pesquera.txt"))  
+cat("Comisión Nacional de Acuacultura y Pesca CONAPESCA. Producción acuícola y  pesquera Golfo de México y Océano Pacifico y Golfo de California (toneladas)
+ \n",file=here("inputs","sensitivity","data_summary","metadata_indice_produccion_pesquera.txt"), append = TRUE)
+cat("Solicitud IFAI. Océano Pacifico y Golfo de California - 2016
+Golfo de México 2018 \n",file=here("inputs","sensitivity","data_summary","metadata_indice_produccion_pesquera.txt"), append = TRUE)
+
+```
+
+```{r}
+
+#Numero de unidades acuicolas*
+#Hectáreas de cultivo
+
+inegi.cost.wgs <- st_read("~/vulnerabilidadbid/outputs/shp_files/comunidades_costeras_30km.shp") %>% 
+  dplyr::select(COM_ID,ENTIDAD,NOM_ENT,MUN,NOM_MUN,LOC,NOM_LOC, POBTOT) %>% 
+ mutate(NOM_MUN =tolower(stri_trans_general(str = NOM_MUN, id = "Latin-ASCII"))) %>% 
+  mutate(NOM_ENT =tolower(stri_trans_general(str = NOM_ENT, id = "Latin-ASCII"))) %>% 
+  mutate(NOM_LOC =tolower(stri_trans_general(str = NOM_LOC, id = "Latin-ASCII"))) 
+
+
+cost.wgs <- inegi.cost.wgs %>% st_set_crs(crs.proj.wgs) 
+
+crs.proj.utm <- ("+proj=utm +zone=12 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs +datum=NAD83") 
+
+cost.utm <- st_transform(cost.wgs, crs.proj.utm)
+
+cost.utm.buff <- st_buffer(cost.utm, dist=10000)
+
+
+unidades.acuicolas <- st_read(here("inputs","sensitivity","poligonos_acuicolas","Acui_3.shp")) %>% 
+  dplyr::select(Permiso, Especies_1)
+
+unidades.acuicolas.utm <- st_transform(unidades.acuicolas, crs.proj.utm)
+
+cost.unidades.acuicolas <- st_join(unidades.acuicolas.utm, cost.utm.buff, join = st_within) 
+
+cost.unidades.acuicolas$area_acui <- st_area(cost.unidades.acuicolas) #Take care of units
+
+cost.area.acuicolas <- cost.unidades.acuicolas %>% 
+  as_tibble %>% 
+  na.omit() %>% 
+  group_by(NOM_ENT, NOM_MUN, NOM_LOC, ENTIDAD, MUN, LOC, COM_ID) %>% 
+  summarise(area_acui_km2=as.numeric(sum(area_acui)/1e+6)) 
+
+cost.no.uacuicolas <- cost.unidades.acuicolas %>% 
+  as_tibble %>% 
+  na.omit() %>% 
+  distinct(Permiso, Especies_1, NOM_ENT, NOM_MUN, NOM_LOC, ENTIDAD, MUN, LOC, COM_ID, POBTOT)  %>% 
+  mutate(nom_id = 1) %>% 
+  group_by(NOM_ENT, NOM_MUN, NOM_LOC, ENTIDAD, MUN, LOC, COM_ID) %>% 
+  summarise(no_un_acuicolas=sum(nom_id)) 
+  
+cost.no.acuicolas <- inegi.cost.wgs %>% 
+  as_tibble %>% 
+  left_join(cost.no.uacuicolas, by=c("COM_ID","ENTIDAD","NOM_ENT","MUN","NOM_MUN","LOC","NOM_LOC")) %>% 
+  left_join(cost.area.acuicolas, by = c("COM_ID","ENTIDAD","NOM_ENT","MUN","NOM_MUN","LOC","NOM_LOC")) %>% 
+  mutate(no_un_acuicolas = if_else(is.na(no_un_acuicolas),0,no_un_acuicolas),
+         area_acui_km2 = if_else(is.na(area_acui_km2),0,area_acui_km2)) %>% 
+  dplyr::select(-geometry)
+  
+cost.no.acuicolas %>% write_csv(here("inputs","sensitivity","data_summary","indice_unidades_acuicolas_loc.csv"))
+
+file.create(here("inputs","sensitivity","data_summary","metadata_indice_unidades_acuicolas_loc.txt"))  
+cat("INAPESCA)
+ \n",file=here("inputs","sensitivity","data_summary","metadata_indice_unidades_acuicolas_loc.txt"), append = TRUE)
+cat("Datos actualizados a 2018 \n",file=here("inputs","sensitivity","data_summary","metadata_indice_unidades_acuicolas_loc.txt"), append = TRUE)
+```
+
+Calculo de susceptibilidad
+
+```{r indices_susceptibilidad, echo=FALSE}
+
+crs.proj.wgs <- "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"
+crs.proj.utm <- ("+proj=utm +zone=12 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs +datum=NAD83") 
+
+data.comm.costas <- st_read(here("outputs","shp_files","comunidades_costeras_30km.shp")) %>% 
+  as_tibble %>% 
+  dplyr::select(COM_ID,ENTIDAD,MUN,LOC,NOM_LOC,POBTOT) %>% 
+  mutate(NOM_LOC =tolower(stri_trans_general(str = NOM_LOC, id = "Latin-ASCII"))) 
+
+in.unidades.acuicolas <- read_csv(here("inputs","sensitivity","data_summary","indice_unidades_acuicolas_loc.csv"))
+in.prod.pesq <- read_csv(here("inputs","sensitivity","data_summary","indice_produccion_pesquera.csv"))
+in.permisos <- read_csv(here("inputs","sensitivity","data_summary","indice_permisos_pesca_acuicolas.csv"))
+in.unidades.econ <- read_csv(here("inputs","sensitivity","data_summary","indice_unidades_economicas.csv"))
+
+susc.datos.com <- in.unidades.acuicolas %>% 
+  left_join(in.prod.pesq, by = c("COM_ID","ENTIDAD","NOM_ENT","MUN","NOM_MUN","LOC","NOM_LOC","POBTOT")) %>% 
+left_join(in.permisos, by = c("COM_ID","ENTIDAD","NOM_ENT","MUN","NOM_MUN","LOC","NOM_LOC","POBTOT","COM_MUN")) %>% 
+left_join(in.unidades.econ, by = c("COM_ID","ENTIDAD","NOM_ENT","MUN","NOM_MUN","LOC","NOM_LOC","POBTOT")) %>% 
+  dplyr::select(-CVE_MUN)
+
+susc.datos.com %>% write_csv(here("inputs","sensitivity","data_summary","datos_susceptibilidad.csv"))
+
+#para todos los valores, los numeros mayores indican mayor dependencia pesquera y mayor susceptibilidad  
+susc.datos.norm <- susc.datos.com %>%   
+ dplyr::select(-ENTIDAD, -NOM_ENT, -MUN, -NOM_MUN, -LOC, -POBTOT, -COM_MUN, -pob_mun, -tot_pob_mun, -tot_captura_loc, -tot_captura_mun, -num_permisos_pesca_mun, -num_permisos_acuicolas, -neg_pesca, -neg_acuicolas, -tot_ue) %>% 
+    mutate_all(~replace(., is.na(.), 0)) 
+#  mutate_if(is.numeric,~ scales::rescale(., to = c(0, 1)))
+
+
+#PCA sobre datos susceptibilidad
+
+pca_factor(susc.datos.norm, datasetname = "Susceptibilidad")
+
+susc.pca <- read_csv(here("outputs","analysis","factor_scores_Susceptibilidad.csv")) %>% 
+  mutate(PC1 = scales::rescale(PC1, to = c(0, 1)))
+
+tabla.edos <- read_csv(here("inputs","estados_region.csv")) %>% 
+   mutate(NOM_ENT = str_to_title(stri_trans_general(str = NOM_ENT, id = "Latin-ASCII")))
+
+
+#estados de la Republica
+est.2019 <- st_read(here("inputs","datos_INEGI_2020","dest2019gw.shp"))
+
+cost.data.pob <- read_csv(here("outputs","comunidades_costeras_INEGI.csv")) 
+
+datos.pca <- susc.pca
+datos.indice <- susc.datos.norm
+nom.indice <-  "Susceptibilidad"
+num.corte <-  0.25
+nom.abr <-  "susceptibilidad"
+
+grafico_datos(cost.data.pob, susc.pca, datos.indice, tabla.edos, nom.indice, num.corte, nom.abr, crs.proj.wgs, crs.proj.utm)
+
+```
+
+
+Capacidad de adaptación
+
+
+```{r capacidad_adaptacion, include=FALSE}
+
+#ADAPTACION
+
+crs.proj.utm <- ("+proj=utm +zone=12 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs +datum=NAD83") 
+crs.proj.wgs <- "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"
+
+#estados de la Republica
+est.2019 <- st_read(here("inputs","datos_INEGI_2020","dest2019gw.shp"))
+
+cost.data.pob <- read_csv(here("outputs","comunidades_costeras_INEGI.csv")) %>% 
+  mutate(COM_MUN = paste(ENTIDAD,MUN,sep="_"))
+
+inegi.cost.wgs <- st_read("~/vulnerabilidadbid/outputs/shp_files/comunidades_costeras_30km.shp") %>% 
+  dplyr::select(COM_ID,ENTIDAD,NOM_ENT,MUN,NOM_MUN,LOC,NOM_LOC, POBTOT) %>% st_set_crs(crs.proj.wgs) 
+
+inegi.cost.utm <- st_transform(inegi.cost.wgs, crs.proj.utm) 
+
+#Composición de la población comp.pob
+# Mujeres jefas de hogar	Población en hogares censales con persona de referencia mujer	PHOGJEF_F
+# Población ocupada	Población de 12 años y más ocupada	POCUPADA
+# Grado promedio de escolaridad	Grado promedio de escolaridad	GRAPROES
+# Educación post-secundaria	Población de 18 años y más con educación posbásica	P18YM_PB
+# Población de 18 años y más	Personas de 18 a 130 años de edad.	P_18YMAS
+# Proporción de población menor de 15 años	Población de 0 a 14 años	POB0_14
+#Hogares en viviendas particulares habitadas. TOTHOG
+#Población de 12 años y más	Personas de 12 a 130 años de edad.	P_12YMAS
+
+comp.pob.in <- cost.data.pob %>% 
+  dplyr::select(COM_ID, NOM_LOC, POBTOT,PHOGJEF_F,POCUPADA,P_12YMAS,GRAPROES,P18YM_PB,P_18YMAS,TOTHOG,POB0_14) %>%   mutate(across(PHOGJEF_F:POB0_14, as.numeric)) %>%
+  mutate_if(is.numeric, funs(ifelse(is.na(.), 0, .))) %>% 
+  mutate(prop_hogares_mujeres = 1-(PHOGJEF_F/TOTHOG)) %>% #- positivo
+  mutate(prop_ocupada = (POCUPADA/P_12YMAS)) %>% #+ positivo
+  mutate(grado_escolar = GRAPROES) %>% #+ positivo
+  mutate(prop_educacion = (P18YM_PB/P_18YMAS)) %>% #+ positivo
+  mutate(prop_menor = (POB0_14/POBTOT)) %>% #+ positivo
+  dplyr::select(COM_ID,NOM_LOC, prop_hogares_mujeres, prop_ocupada, grado_escolar, prop_educacion, prop_menor) %>% 
+  mutate_if(is.numeric, funs(ifelse(is.na(.), 0, .)))
+  
+
+#  mutate_if(is.numeric,~ scales::rescale(., to = c(0, 1))) 
+
+# Pobreza
+# Población sin escolaridad	Población de 15 años y más sin escolaridad	P15YM_SE
+# Población con servicios de salud subsidiados	Población sin afiliación a servicios de salud +Población afiliada a servicios de salud en el Instituto de Salud para el Bienestar	PDER_SEGP + PSINDER
+# Hogares sin bienes	Viviendas particulares habitadas sin ningún bien	VPH_SNBIEN
+# Población en pobreza que recibe subsidios	
+#Población de 12 años y más desocupada	PDESOCUP
+#Total de viviendas particulares habitadas TVIVPARHAB
+#Población de 15 años y más	Personas de 15 a 130 años de edad.	P_15YMAS
+#Población de 12 años y más	Personas de 12 a 130 años de edad.	P_12YMAS
+
+#indice de rezago social
+irs.data <- read_xlsx(here("inputs","adaptive_capacity","IRS_localidad_2020.xlsx")) %>% 
+  dplyr::select(COM_ID, ent,mun,loc,irs) %>% 
+   right_join(cost.data.pob, by=c("COM_ID")) %>% 
+  mutate_if(is.numeric, funs(ifelse(is.na(.), 0, .))) %>% 
+  dplyr::select(COM_ID, irs)
+
+#pobreza alimenticia a nivel municipal
+pob.mun.al <- read_xlsx(here("inputs","adaptive_capacity","Pobreza_dimension_ing_municipal_1990_2000_2010_DA.xlsx")) %>% 
+  mutate(COM_MUN = paste(cve_ent,cve_mun,sep="_")) %>% 
+   mutate(prop_alim = porc_alim_2010/100) %>% 
+  dplyr::select(COM_MUN,prop_alim)
+
+pobr.in <- cost.data.pob %>% 
+  dplyr::select(COM_ID, COM_MUN, NOM_LOC,POBTOT,P15YM_SE,P_15YMAS,PDER_SEGP,PSINDER,VPH_SNBIEN,TVIVPARHAB,P_12YMAS,PDESOCUP) %>% 
+  mutate(across(P15YM_SE:PDESOCUP, as.numeric)) %>% 
+  mutate_if(is.numeric, funs(ifelse(is.na(.), 0, .))) %>% 
+  mutate(prop_sin_escolar = P15YM_SE/P_15YMAS) %>% # + negativo
+  mutate(prop_sin_salud = ((PDER_SEGP+PSINDER)/POBTOT)) %>% # + negativo 
+  mutate(prop_hog_sbienes = VPH_SNBIEN/TVIVPARHAB) %>%# + negativo
+  mutate(prop_desocup = (PDESOCUP/P_12YMAS)) %>% # + negativo
+  left_join(irs.data, by="COM_ID") %>% # + negativo
+  left_join(pob.mun.al, by="COM_MUN") %>% # + negativo
+  mutate_if(is.numeric, funs(ifelse(is.na(.), 0, .))) %>% 
+ dplyr::select(COM_ID, NOM_LOC, prop_sin_escolar, prop_sin_salud,prop_hog_sbienes, prop_desocup, prop_alim, irs) 
+
+#Caracteristicas de los hogares
+# Hogares con > 2 recámaras	Viviendas particulares habitadas con dos dormitorios y más	VPH_2YMASD
+# Hogares con acceso a tecnologias de la informacion	Viviendas particulares habitadas que no disponen de las tecnologías de la información y de la comunicación (VPH_SINTIC),	VIVPAR_HAB - VPH_SINTIC
+# Hogares con piso de tierra	Viviendas particulares habitadas con piso de tierra	VPH_PISOTI
+# Hogares con todos los servicios	Total viviendas particulares habitadas - viviendas particulares sin bienes	VIVPAR_HAB - VPH_SNBIEN
+# Viviendas particulares habitadas que disponen de energía eléctrica	Viviendas particulares habitadas que tienen energía eléctrica. Comprende las viviendas particulares para las que se captaron las características de la vivienda, clasificadas como: casa única en el terreno, departamento en edificio, vivienda o cuarto en vecindad y vivienda o cuarto en azotea y a las que no especificaron clase de vivienda.	VPH_C_ELEC
+#Viviendas particulares habitadas que disponen de drenaje	Viviendas particulares habitadas que tienen drenaje conectado a la red pública, fosa séptica, barranca, grieta, río, lago o mar. VPH_DRENAJ
+
+#Total de viviendas particulares habitadas TVIVPARHAB
+
+ 
+carac.hogares.in <- cost.data.pob %>% 
+  dplyr::select(COM_ID, COM_MUN, NOM_LOC,POBTOT,VPH_2YMASD, VPH_SINTIC, VPH_PISOTI, VPH_DRENAJ, TVIVPARHAB,VPH_SNBIEN,VPH_C_ELEC) %>% 
+  mutate(across(VPH_2YMASD:VPH_C_ELEC, as.numeric)) %>% 
+  mutate_if(is.numeric, funs(ifelse(is.na(.), 0, .))) %>% 
+  mutate(hogares_recamaras = VPH_2YMASD/TVIVPARHAB) %>% #+ positivo
+  mutate(hogares_tecnologia = ((TVIVPARHAB - VPH_SINTIC)/TVIVPARHAB)) %>% #+ positivo 
+  mutate(hogares_ptierra = 1-(VPH_PISOTI/TVIVPARHAB)) %>% #- positivo
+  mutate(hogares_servicios = ((TVIVPARHAB - VPH_SNBIEN)/TVIVPARHAB)) %>% #+ positivo 
+  mutate(hogares_eelectrica = (VPH_C_ELEC/TVIVPARHAB)) %>% #+ positivo 
+  mutate(hogares_drenaje = (VPH_DRENAJ/TVIVPARHAB)) %>% #+ positivo 
+  dplyr::select(COM_ID, NOM_LOC, hogares_recamaras, hogares_tecnologia, hogares_ptierra,hogares_servicios,hogares_eelectrica, hogares_drenaje) %>% 
+  mutate_if(is.numeric, funs(ifelse(is.na(.), 0, .)))
+  
+
+
+#Infraestructura
+#Viviendas particulares habitadas que disponen de agua entubada en el ámbito de la vivienda	Viviendas particulares habitadas que tienen disponibilidad de agua entubada dentro de la vivienda, o fuera de la vivienda, pero dentro del terreno. VPH_AGUADV
+
+# Distancia a la vía más cercana
+# Distancia a la carretera mas cercana
+
+dist.via <- read_xlsx(here("inputs","adaptive_capacity","tabla_comunidades_carreteras.xlsx")) %>% 
+  dplyr::select(COM_ID,NEAR_DIST_metros) %>% 
+  dplyr::rename(dist_via = NEAR_DIST_metros) 
+
+long.caminos <- read_xlsx(here("inputs","adaptive_capacity","carret_mpios_edos2.xlsx")) %>% 
+  mutate(COM_MUN = paste(CVE_EDO,CVE_MUN, sep="_")) %>%
+  group_by(COM_MUN) %>% 
+  summarise(long_cam = sum(Length_km)) 
+
+acceso.pav <- read_csv(here("inputs","adaptive_capacity","Grado de accesibilidad a carretera pavimentada a nivel localidad, 2010.csv")) %>%
+  dplyr::select(COM_ID, distancia)
+
+disp.agua <- st_read(here("inputs","adaptive_capacity","dispaguagw.shp")) 
+
+disp.min <- calc_buffer(thispolygon=disp.agua,thisfield="Disp_HM3",inegi.cost.utm, thisfunction='min')
+
+disp.loc <- inegi.cost.utm %>% 
+  bind_cols(disp.min) %>% 
+  as_tibble %>% 
+  dplyr::select(COM_ID,layer) %>% 
+  dplyr::rename(disp_agua = layer)
+
+
+infra.com.in <- cost.data.pob %>% 
+  dplyr::select(COM_ID, COM_MUN, NOM_LOC,TVIVPARHAB, VPH_AGUADV) %>% 
+  mutate(across(TVIVPARHAB:VPH_AGUADV, as.numeric)) %>% 
+  mutate(hogares_aguaent = VPH_AGUADV/TVIVPARHAB) %>% 
+  left_join(long.caminos, by ="COM_MUN") %>% 
+  left_join(dist.via, by ="COM_ID") %>% 
+  left_join(acceso.pav, by = "COM_ID") %>% 
+  left_join(disp.loc, by = "COM_ID") %>% 
+  dplyr::select(COM_ID, NOM_LOC, hogares_aguaent, long_cam ,dist_via, distancia ,disp_agua) %>% 
+  mutate_if(is.numeric, funs(ifelse(is.na(.), 0, .))) %>% 
+  mutate(dist_via = -1 * dist_via) %>% # menor es positivo
+  mutate(distancia = -1 * distancia) # menor es positivo
+
+
+# Estructura del empleo
+# Población económicamente activa	Población de 12 años y más económicamente activa		PEA
+# Población empleada	Población de 12 años y más ocupada		POCUPADA
+# Grado promedio de escolaridad	-		GRAPROES
+# Población con servicios de salud	Población afiliada a servicios de salud		PDER_SS
+# Población de 12 años y más	Personas de 12 a 130 años de edad.	P_12YMAS
+
+comp.eco <- read_csv(here("inputs","adaptive_capacity","ECI.csv")) %>% 
+  dplyr::select(COM_MUN,`Number of Employees Midpoint ECI`) %>% 
+  dplyr::rename(in_compeco="Number of Employees Midpoint ECI")
+
+ind.mar.in <- read_xls(here("inputs","adaptive_capacity","IML_2020.xls"), sheet =2) %>% 
+  mutate(COM_ID = paste(as.numeric(ENT),as.numeric(MUN),as.numeric(LOC),sep="_")) %>% 
+  dplyr::select(COM_ID,IM_2020) %>% 
+  dplyr::rename(in_marg=IM_2020)
+
+ind.mar <- read_xls(here("inputs","adaptive_capacity","IML_2020.xls"), sheet =3) %>% 
+  mutate(COM_ID = paste(as.numeric(ENT),as.numeric(MUN),as.numeric(LOC),sep="_")) %>% 
+  dplyr::select(COM_ID,IM_2020) %>% 
+  dplyr::rename(in_marg=IM_2020) %>% 
+  bind_rows(ind.mar.in)
+
+
+carac.empleo.in <- cost.data.pob %>% 
+  dplyr::select(COM_ID, COM_MUN, NOM_LOC, POBTOT, PEA, POCUPADA, GRAPROES, PDER_SS, P_12YMAS) %>% 
+  mutate(across(PEA:P_12YMAS, as.numeric)) %>% 
+  mutate(pob_ecactiva = PEA/P_12YMAS) %>% #+ positivo
+  mutate(pob_empleada = POCUPADA/P_12YMAS) %>% #+ positivo
+  mutate(grad_esc = GRAPROES) %>% #+ positivo
+  mutate(pob_salud = PDER_SS/POBTOT) %>% #+ positivo 
+  left_join(comp.eco, by="COM_MUN") %>% #+ positivo 
+  left_join(ind.mar, by="COM_ID") %>% #+ positivo 
+  dplyr::select(COM_ID, NOM_LOC, pob_ecactiva,pob_empleada,grad_esc,pob_salud, in_compeco, in_marg) %>% 
+  mutate_if(is.numeric, funs(ifelse(is.na(.), 0, .)))
+  
+ 
+
+#poblacion indigena
+#Población en hogares censales indígenas		PHOG_IND
+
+#alfabetismo indigena por municipio
+#Poblacion indígena alfabeta y analfabeta en hombres y mujeres de 15 y más. 
+ana.ind <- st_read(here("inputs","adaptive_capacity","alfaindigw.shp")) %>% 
+  as_tibble %>% 
+  mutate(prop_inana =  pi15analfa/piobindi) %>% 
+  na.omit %>% 
+  mutate(COM_MUN = paste(as.numeric(CVE_ENT),as.numeric(CVE_MUN),sep="_")) %>% 
+  dplyr::select(COM_MUN,prop_inana) %>% 
+  distinct(COM_MUN,prop_inana)
+
+#economia indigena
+
+#Población activa, Población desocupada, Población inactiva, Población masculina, Población ocupada, 12 años
+eco.ind <- st_read(here("inputs","adaptive_capacity","ecoindigw.shp")) %>% 
+  as_tibble %>% 
+  mutate(prop_indes =  pidesocup/pobindi) %>% 
+  na.omit %>% 
+  mutate(COM_MUN = paste(as.numeric(CVE_ENT),as.numeric(CVE_MUN),sep="_")) %>% 
+  dplyr::select(COM_MUN,prop_indes) %>% 
+  distinct(COM_MUN,prop_indes)
+
+#migracion indigena
+
+mig.ind <- st_read(here("inputs","adaptive_capacity","migindigw.shp")) %>% 
+  as_tibble %>% 
+  na.omit %>% 
+  mutate(prop_inmig =  pilnacoten/pobindi) %>% 
+  mutate(prop_inmig = if_else(is.nan(prop_inmig),0,prop_inmig)) %>% 
+  mutate(COM_MUN = paste(as.numeric(CVE_ENT),as.numeric(CVE_MUN),sep="_")) %>% 
+  dplyr::distinct(COM_MUN,prop_inmig) 
+
+#Población total nacidos en la entidad, Población total nacidos en otra entidad, Población total nacidos no especificada, Población total que reside en la entidad y Población total que residen en otra entidad.
+
+pob.indig.in <- cost.data.pob %>% 
+  dplyr::select(COM_ID, COM_MUN, NOM_LOC, POBTOT, PHOG_IND) %>% 
+  mutate(prop_pind = 1-(as.numeric(PHOG_IND)/POBTOT)) %>% #+ negativo
+  left_join(mig.ind, by="COM_MUN") %>% #+ negativo
+  left_join(ana.ind,by="COM_MUN") %>% #+ negativo
+  left_join(eco.ind,by="COM_MUN") %>% #+ negativo
+  mutate_if(is.numeric, funs(ifelse(is.na(.), 0, .))) %>% 
+  dplyr::select(COM_ID, NOM_LOC, prop_pind, prop_inmig, prop_inana, prop_indes) 
+
+
+# Cambio en la población económicamente activa (2010-2020)	Población de 12 años y más económicamente activa		PEA
+# Población que reside en otro estado	Población de 5 años y más residente en otra entidad en marzo de 2015		PRESOE15
+# Cambio en la población soltera			P12YM_SOLT
+# Cambio en los hogares femeninos	Hogares en viviendas particulares habitadas donde la persona de referencia es mujer.	HOGJEF_F
+#Población sin religión o sin adscripción religiosa	Personas que declararon no tener religión o no estar adscritas en alguna.	PSIN_RELIG
+
+censo.2010 <- fread(here("inputs","datos_INEGI_2010","iter_00_cpv2010","conjunto_de_datos","iter_00_cpv2010.csv")) %>% 
+  as_tibble %>% 
+  filter(!is.na(longitud)) %>% 
+  mutate(COM_ID=paste(as.numeric(entidad),as.numeric(mun),as.numeric(loc),sep="_")) %>% 
+   dplyr::select(COM_ID,pobtot, pea, p_12ymas, p12ym_solt,hogjef_f,psin_relig) %>% 
+  mutate(across(pea:psin_relig, as.numeric)) %>% 
+  mutate_if(is.numeric, funs(ifelse(is.na(.), 0, .)))
+
+dis.personal.in <- cost.data.pob %>% 
+  dplyr::select(COM_ID, NOM_LOC, POBTOT, PEA, P_5YMAS, PRESOE15, P12YM_SOLT, P_12YMAS, HOGJEF_F,PSIN_RELIG) %>% 
+  mutate(across(PEA:PSIN_RELIG, as.numeric)) %>% 
+  mutate_if(is.numeric, funs(ifelse(is.na(.), 0, .))) %>% 
+  left_join(censo.2010, by="COM_ID") %>% 
+  mutate(cam_pe = (pea/p_12ymas)-(PEA/P_12YMAS)) %>% #+ + positivo
+  mutate(cam_mig = 1-(PRESOE15/P_5YMAS)) %>% #+ negativo
+  mutate(cam_pobsol = (p12ym_solt/p_12ymas)-(P12YM_SOLT/P_12YMAS)) %>% #+ positivo
+  mutate(cam_hogfem = (hogjef_f/pobtot)-(HOGJEF_F/POBTOT)) %>% #+ positivo
+  mutate(cam_religion = (psin_relig)-(PSIN_RELIG/POBTOT)) %>% #+ positivo
+  dplyr::select(COM_ID, NOM_LOC, cam_pe, cam_mig, cam_pobsol, cam_hogfem) %>% 
+  mutate_if(is.numeric, funs(ifelse(is.na(.), 0, .)))
+  
+
+datasetname = "comp_pob"
+comp.pob.in %>%
+     mutate(NOM_LOC=tolower(stri_trans_general(str =NOM_LOC, id = "Latin-ASCII"))) %>% 
+  pca_factor(., datasetname) 
+
+datasetname = "pobreza"
+pobr.in %>%
+     mutate(NOM_LOC=tolower(stri_trans_general(str =NOM_LOC, id = "Latin-ASCII"))) %>% 
+  pca_factor(., datasetname) 
+
+datasetname = "carac_hogares"
+carac.hogares.in %>%
+     mutate(NOM_LOC=tolower(stri_trans_general(str =NOM_LOC, id = "Latin-ASCII"))) %>% 
+  pca_factor(., datasetname) 
+
+datasetname = "infraestructura"
+infra.com.in %>%
+     mutate(NOM_LOC=tolower(stri_trans_general(str =NOM_LOC, id = "Latin-ASCII"))) %>% 
+  pca_factor(., datasetname) 
+ 
+datasetname = "carac_empleo"
+carac.empleo.in %>%
+     mutate(NOM_LOC=tolower(stri_trans_general(str =NOM_LOC, id = "Latin-ASCII"))) %>% 
+  pca_factor(., datasetname) 
+
+
+datasetname = "pob_indigena"
+pob.indig.in %>%
+     mutate(NOM_LOC=tolower(stri_trans_general(str =NOM_LOC, id = "Latin-ASCII"))) %>% 
+  pca_factor(., datasetname) 
+
+ datasetname = "disrupcion_pers"
+dis.personal.in %>%
+     mutate(NOM_LOC=tolower(stri_trans_general(str =NOM_LOC, id = "Latin-ASCII"))) %>% 
+  pca_factor(., datasetname) 
+
+
+adap.datos.com <- cost.data.pob %>% 
+  dplyr::select(COM_ID,ENTIDAD,NOM_ENT,MUN,NOM_MUN,LOC,NOM_LOC,POBTOT) %>% 
+  left_join(comp.pob.in, by=c("COM_ID", "NOM_LOC")) %>% 
+  left_join(pobr.in, by=c("COM_ID", "NOM_LOC")) %>% 
+  left_join(carac.hogares.in, by=c("COM_ID", "NOM_LOC")) %>% 
+  left_join(carac.empleo.in, by=c("COM_ID", "NOM_LOC")) %>% 
+  left_join(infra.com.in, by=c("COM_ID", "NOM_LOC")) %>% 
+  left_join(pob.indig.in, by=c("COM_ID", "NOM_LOC")) %>% 
+ left_join(dis.personal.in, by=c("COM_ID", "NOM_LOC")) %>% 
+    mutate(NOM_LOC=tolower(stri_trans_general(str =NOM_LOC, id = "Latin-ASCII"))) %>% 
+  mutate(NOM_MUN=tolower(stri_trans_general(str =NOM_MUN, id = "Latin-ASCII"))) %>% 
+  mutate(NOM_ENT=tolower(stri_trans_general(str =NOM_ENT, id = "Latin-ASCII")))
+
+
+adap.datos.com %>% write_csv(here("inputs","adaptive_capacity","data_summary","datos_capacidadadaptacion.csv"))
+
+adap.datos.norm <- adap.datos.com %>%   
+ dplyr::select(-ENTIDAD, -NOM_ENT, -MUN, -NOM_MUN, -LOC, -POBTOT) %>% 
+    mutate_all(~replace(., is.na(.), 0)) 
+
+  
+#PCA 
+
+adap.vars <- c("disrupcion_pers","pob_indigena","carac_empleo","infraestructura","carac_hogares","pobreza","comp_pob"
+)
+
+get_pc <- function(datasetname){
+ 
+   index.pers <- read_csv(here("outputs","analysis",paste0("factor_scores_",datasetname,".csv"))) %>% 
+    dplyr::rename({{datasetname}}:=PC1) %>% 
+    dplyr::select(-LOC)
+   
+   return(index.pers)
+}
+
+adap.pca.all <- lapply(adap.vars,get_pc) %>% 
+  bind_cols 
+
+adap.pca <- adap.pca.all %>% 
+  mutate(pobreza = -1 * disrupcion_pers) %>%
+  mutate(pob_indigena = -1 * pob_indigena) %>% 
+  mutate_if(is.numeric,~ scales::rescale(., to = c(0, 1))) %>% 
+  mutate(cap_adap = (disrupcion_pers + pob_indigena + carac_empleo + infraestructura + carac_hogares + pobreza + comp_pob)) %>% 
+  dplyr::select(cap_adap) %>% 
+  dplyr::rename(PC1 = cap_adap)
+
+
+tabla.edos <- read_csv(here("inputs","estados_region.csv")) %>% 
+   mutate(NOM_ENT = str_to_title(stri_trans_general(str = NOM_ENT, id = "Latin-ASCII")))
+
+
+#estados de la Republica
+est.2019 <- st_read(here("inputs","datos_INEGI_2020","dest2019gw.shp"))
+
+cost.data.pob <- read_csv(here("outputs","comunidades_costeras_INEGI.csv")) 
+
+datos.pca <- adap.pca
+datos.indice <- adap.datos.norm
+nom.indice <-  "Capacidad adaptativa"
+num.corte <-  0.25
+nom.abr <-  "Capacidad adaptativa"
+
+grafico_datos(cost.data.pob, datos.pca, datos.indice, tabla.edos, nom.indice, num.corte, nom.abr, crs.proj.wgs, crs.proj.utm)
+
+
+```
+
+
+Exposicion, extraccion de datos
+
+Guardar datos WorldClim
+
+```{r}
+#guardar capas terrestres futuras
+
+wordclim.ssp126 <- stack(here("inputs","WorldClim","ssp126","wc2.1_2.5m_bioc_CNRM-CM6-1_ssp126_2041-2060.tif"))
+
+these.names <- c("temperatura_promedio_anual","intervalo_diurno","precipitacion_promedio")
+ these.layers <- c(1,2,12)
+ 
+for(eachlayer in 1:3){
+  
+  thislayer <- these.layers[eachlayer]
+  
+  this.data <- wordclim.ssp126[[thislayer]]
+  plot(this.data)
+  writeRaster(this.data,paste0(here("inputs","exposure","futuro_terrestre/"),"worldclim_",these.names[eachlayer],"_2041-2060_ssp126"), format="GTiff", overwrite = TRUE)
+  
+  
+}
+
+wordclim.ssp585 <- stack(here("inputs","WorldClim","ssp585","wc2.1_2.5m_bioc_CNRM-CM6-1_ssp585_2041-2060.tif"))
+
+these.names <- c("temperatura_promedio_anual","intervalo_diurno","precipitacion_promedio")
+ these.layers <- c(1,2,12)
+ 
+for(eachlayer in 1:3){
+  
+  thislayer <- these.layers[eachlayer]
+  
+  this.data <- wordclim.ssp585[[thislayer]]
+  plot(this.data)
+  writeRaster(this.data,paste0(here("inputs","exposure","futuro_terrestre/"),"_",these.names[eachlayer],"_2041-2060_ssp585"), format="GTiff", overwrite = TRUE)
+  
+  
+}
+
+```
+
+Datos exposicion
+```{r datos_exposicion, include=FALSE}
+
+#https://epsg.io/4485
+
+cost.data.pob <- read_csv(here("outputs","comunidades_costeras_INEGI.csv"))
+
+crs.proj.utm <- ("+proj=utm +zone=12 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs +datum=NAD83") 
+crs.proj.wgs <- "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"
+#estados de la Republica
+est.2019 <- st_read(here("inputs","datos_INEGI_2020","dest2019gw.shp"))
+
+inegi.cost.wgs <- st_read("~/vulnerabilidadbid/outputs/shp_files/comunidades_costeras_30km.shp") %>% 
+  dplyr::select(COM_ID,ENTIDAD,NOM_ENT,MUN,NOM_MUN,LOC,NOM_LOC, POBTOT) %>% st_set_crs(crs.proj.wgs) 
+
+inegi.cost.utm <- st_transform(inegi.cost.wgs, crs.proj.utm) 
+
+tabla.edos <- read_csv(here("inputs","estados_region.csv"))
+
+coste.coords <- cost.data.pob %>% 
+  dplyr::select(COM_ID, dec_lon, dec_lat) 
+
+coordinates(coste.coords) <- c("dec_lon","dec_lat")
+
+#definir proyeccion geografica y proyectar a utm
+proj4string(coste.coords) <- crs.proj.wgs
+coste.coords.sf <- st_as_sf(coste.coords)
+coste.coords.proj <- st_transform(coste.coords.sf, crs.proj.utm) 
+
+coste.coords <- coste.coords@coords %>% 
+  as.data.frame()
+
+coste.comm.buff <- geobuffer_pts(xy = coste.coords, dist_m = 50*10^3) # 50 km
+
+coste.buff.sf <- st_as_sf(coste.comm.buff)
+
+
+ 
+exp.files <- list.files(path=here("inputs","exposure"),pattern = "*.tif$|*.shp$", recursive = TRUE, full.names = TRUE) %>% 
+  as_tibble %>% 
+  filter(!grepl("min",value)) %>% 
+  filter(!grepl("max",value)) 
+
+expo.num <- 1:nrow(exp.files)
+vars.expo <- read_csv(here("inputs","exposure","var_noms_exposicion.csv"))
+
+cost.data.pob <- read_csv(here("outputs","comunidades_costeras_INEGI.csv")) %>% dplyr::select(COM_ID,NOM_LOC) %>% 
+    mutate(NOM_LOC=tolower(stri_trans_general(str =NOM_LOC, id = "Latin-ASCII")))
+
+lapply(expo.num,expo_raster,vars.expo, coste.buff, cost.data.pob)
+
+
+
+```
+
+
+Estimar exposicion
+```{r calc_expo, include=FALSE}
+
+crs.proj.utm <- ("+proj=utm +zone=12 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs +datum=NAD83") 
+crs.proj.wgs <- "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"
+
+cost.data.pob <- read_csv(here("outputs","comunidades_costeras_INEGI.csv")) %>% dplyr::select(COM_ID,NOM_LOC) %>% 
+    mutate(NOM_LOC=tolower(stri_trans_general(str = NOM_LOC, id = "Latin-ASCII")))
+
+expo.summary.files <- list.files(here("inputs","exposure"),pattern="rasterdata.csv", full.names = TRUE)
+
+read_exposure <- function(eachfile){
+  
+  this.data.wide <- read_csv(eachfile) %>% 
+     pivot_wider(names_from = variable, values_from = value) 
+  
+  print(str(this.data.wide))
+  
+  this.data <- read_csv(eachfile)
+  return(this.data)
+}
+
+expo.data <- lapply(expo.summary.files,read_exposure) %>% 
+  bind_rows 
+
+expo.data.hist <- expo.data %>% 
+  filter(escenario=="historico") %>% 
+  pivot_wider(names_from = variable, values_from = value) %>% 
+  mutate(oxigeno_disuelto = -1 * oxigeno_disuelto) %>% 
+  mutate(productividad_primaria = -1 * productividad_primaria) %>% 
+  mutate(impacto_antropogenico = -1 * impacto_antropogenico) %>% 
+  dplyr::select(-escenario) %>% 
+  mutate_all(~replace(., is.na(.), 0)) %>% 
+  mutate_all(~replace(., is.nan(.), 0))
+
+expo.data.hist.fut <- expo.data.hist %>% 
+  dplyr::select(-oxigeno_disuelto,-temperatura_superficial_del_mar,-productividad_primaria, -intervalo_diurno, -precipitacion_promedio,-temperatura_promedio_anual)
+  
+expo.data.ssp.bajo <- expo.data %>% 
+  filter(escenario=="ssp126") %>% 
+  pivot_wider(names_from = variable, values_from = value) %>% 
+  mutate(oxigeno_disuelto = -1 * oxigeno_disuelto) %>% 
+  mutate(productividad_primaria = -1 * productividad_primaria) %>% 
+  left_join(expo.data.hist.fut, by=c("COM_ID", "NOM_LOC","index_var")) %>% 
+  dplyr::select(-escenario)
+
+expo.data.ssp.alto <- expo.data %>% 
+  filter(escenario=="ssp585") %>% 
+  pivot_wider(names_from = variable, values_from = value) %>% 
+  mutate(oxigeno_disuelto = -1 * oxigeno_disuelto) %>% 
+  mutate(productividad_primaria = -1 * productividad_primaria) %>% 
+  left_join(expo.data.hist.fut, by=c("COM_ID", "NOM_LOC","index_var")) %>% 
+  dplyr::select(-escenario)
+
+pob.names <- read_csv(here("outputs","comunidades_costeras_INEGI.csv")) %>% 
+  dplyr::select(COM_ID,ENTIDAD,NOM_ENT,MUN,NOM_MUN,LOC,NOM_LOC,POBTOT)
+
+exp.com.hist <- expo.data.hist %>% 
+  dplyr::select(-NOM_LOC, -index_var) %>%   
+  left_join(pob.names, by=c("COM_ID")) 
+write_csv(exp.com.hist, here("inputs","exposure","data_summary","datos_exposicion_historico.csv"))
+
+exp.com.ssp.bajo <-  expo.data.ssp.bajo %>% 
+  dplyr::select(-NOM_LOC, -index_var) %>%   
+  left_join(pob.names, by=c("COM_ID")) 
+write_csv(exp.com.ssp.bajo,here("inputs","exposure","data_summary","datos_exposicion_ssp126.csv"))
+
+ exp.com.ssp.alto <-  expo.data.ssp.alto %>% 
+  dplyr::select(-NOM_LOC, -index_var) %>%   
+  left_join(pob.names, by=c("COM_ID"))
+write_csv(exp.com.ssp.alto, here("inputs","exposure","data_summary","datos_exposicion_ssp585.csv"))
+
+#datos historicos
+pca_factor(expo.data.hist, datasetname = "Exposicion_historica")
+
+res.pca.hist <- read_csv(here("outputs","analysis","factor_scores_Exposicion_historica.csv")) %>% 
+  mutate(PC1 = scales::rescale(PC1, to = c(0, 1)))
+
+#ssp126
+pca_factor(expo.data.ssp.bajo, datasetname = "Exposicion_ssp126")
+
+res.pca.ssp.bajo <- read_csv(here("outputs","analysis","factor_scores_Exposicion_ssp126.csv")) %>% 
+  mutate(PC1 = scales::rescale(PC1, to = c(0, 1)))
+
+#ssp585
+pca_factor(expo.data.ssp.bajo, datasetname = "Exposicion_ssp585")
+
+res.pca.ssp.alto <- read_csv(here("outputs","analysis","factor_scores_Exposicion_ssp585.csv")) %>% 
+  mutate(PC1 = scales::rescale(PC1, to = c(0, 1)))
+
+cost.data.pob <- read_csv(here("outputs","comunidades_costeras_INEGI.csv")) 
+
+
+datos.pca <- res.pca.hist
+datos.indice <- exp.com.hist 
+nom.indice <- "Exposición historica"
+nom.corte <- 0.25
+nom.abr <- "Exposición historica"
+
+grafico_datos_exp(cost.data.pob, datos.pca, datos.indice, tabla.edos, nom.indice, nom.corte, nom.abr,crs.proj.wgs, crs.proj.utm)
+ 
+datos.pca <- res.pca.ssp.bajo
+datos.indice <- exp.com.ssp.bajo
+nom.indice <- "Exposición ssp126"
+nom.corte <- 0.25
+nom.abr <- "Exposición ssp126"
+
+grafico_datos_exp(cost.data.pob, datos.pca, datos.indice, tabla.edos, nom.indice, nom.corte, nom.abr,crs.proj.wgs, crs.proj.utm)
+
+datos.pca <- res.pca.ssp.alto
+datos.indice <- exp.com.ssp.alto
+nom.indice <- "Exposición ssp585"
+nom.corte <- 0.25
+nom.abr <- "Exposición ssp585"
+
+grafico_datos_exp(cost.data.pob, datos.pca, datos.indice, tabla.edos, nom.indice, nom.corte, nom.abr,crs.proj.wgs, crs.proj.utm)
+
+
+```
+
+Vulnerabilidad
+```{r}
+
+tabla.edos <- read_csv(here("inputs","estados_region.csv"))
+
+expo.base <- read_csv(here("outputs","analysis","Exposicion_historica_datos_graficos.csv")) %>% 
+  dplyr::rename(exposicion_base=PCA_norm)%>% 
+  dplyr::select(COM_ID, exposicion_base)
+
+expo_dat  <- here("outputs","analysis","Exposicion_ssp126_datos_graficos.csv")
+adap_dat <- here("outputs","analysis","adaptacion_datos_graficos.csv")
+susc_dat <- here("outputs","analysis","susceptibilidad_datos_graficos.csv")
+escenario.nom <- "Vulnerabilidad ssp126"
+
+vul_analisis(expo_dat, adap_dat, susc_dat, escenario.nom, expo.base)
+
+
+expo_dat  <- here("outputs","analysis","Exposicion_ssp585_datos_graficos.csv")
+adap_dat <- here("outputs","analysis","adaptacion_datos_graficos.csv")
+susc_dat <- here("outputs","analysis","susceptibilidad_datos_graficos.csv")
+escenario.nom <- "Vulnerabilidad ssp585"
+
+vul_analisis(expo_dat, adap_dat, susc_dat, escenario.nom, expo.base)
+
+
+
+
+```
+Vulnerabilidad de comunidades seleccionadas
+```{r}
+
+cost.data.pob <- read_csv(here("outputs","comunidades_costeras_INEGI.csv")) %>% dplyr::select(COM_ID,NOM_LOC) %>% 
+    mutate(NOM_LOC=tolower(stri_trans_general(str = NOM_LOC, id = "Latin-ASCII")))
+
+inegi.2020 <- read_csv(paste0(here(),"/inputs/datos_INEGI_2020/conjunto_de_datos/conjunto_de_datos_iter_00_cpv2020.csv"))
+
+inegi.2020.id <- inegi.2020 %>% 
+  filter(!is.na(LONGITUD)) %>% 
+  mutate(COM_ID = paste0(ENTIDAD,"_",MUN, "_",LOC)) %>% 
+  dplyr::select(COM_ID, everything()) %>% 
+  dplyr::mutate(across(c("NOM_ENT","NOM_MUN","NOM_LOC"), ~ tolower(.))) %>% 
+    dplyr::mutate(across(c("NOM_ENT","NOM_MUN","NOM_LOC"), ~ stri_trans_general(str = ., id = "Latin-ASCII")))
+
+
+
+lista.comunidades <- readxl::read_xlsx(here("inputs","Lista de comunidades Grupo BSP .xlsx"), sheet = 2) %>% 
+  dplyr::rename(NOM_MUN = Municipio, NOM_ENT = Entidad, NOM_LOC = `Nombre de la comunidad`) %>% 
+  dplyr::mutate(across(NOM_LOC:NOM_ENT, ~ tolower(.))) %>% 
+  dplyr::mutate(NOM_ENT=gsub("californía","california", NOM_ENT)) %>% 
+  dplyr::mutate(across(NOM_LOC:NOM_ENT, ~ stri_trans_general(str = ., id = "Latin-ASCII"))) %>% 
+  dplyr::distinct(NOM_LOC, NOM_MUN, NOM_ENT) %>% 
+  dplyr::mutate(NOM_LOC=if_else(NOM_LOC=="antonio r laureles","antonio r. laureles", NOM_LOC)) 
+
+
+valores.vul.585 <- read_csv(here("outputs","analysis","vulne_datos_Vulnerabilidad ssp585.csv")) %>% 
+  arrange(desc(vul_norm)) %>% 
+  mutate(vul_rank = 1:nrow(.))
+
+valores.vul.126 <- read_csv(here("outputs","analysis", "vulne_datos_Vulnerabilidad ssp126.csv")) %>% 
+   arrange(desc(vul_norm)) %>% 
+  mutate(vul_rank = 1:nrow(.))
+
+vul.lista.comunidades <-lista.comunidades %>% 
+  left_join(valores.vul.585, by = c("NOM_ENT", "NOM_MUN", "NOM_LOC")) %>% 
+  filter(!is.na(adaptacion))
+
+com.alta.vul <- valores.vul.585 %>% 
+  filter(NOM_ENT %in% c("jalisco", "colima", "michoacan de ocampo", "guerrero")) %>% 
+  group_by(NOM_ENT) %>% 
+  slice_max(order_by = vul_norm, n = 3)
+  
+vul.res.ord <- vul.lista.comunidades %>% 
+  bind_rows(com.alta.vul) %>% 
+   mutate(category = if_else(vul_norm < 0.25, "Baja", if_else(vul_norm > 0.75, "Alta","Mediana"))) %>% 
+   mutate(NOM_ENT_fac=factor(NOM_ENT, levels=ent.ord)) %>% # This trick update the factor levels
+   mutate(category_fac=factor(category, levels=c("Alta","Mediana","Baja")))   # This trick update the factor levels
+
+  
+ent.ord <- vul.res.ord  %>%  distinct(NOM_ENT) %>% pull(NOM_ENT)
+
+ 
+cols <- c("firebrick", "gold", "forestgreen")
+
+  
+for(eachstate in 1:length(ent.ord)){
+    
+  
+    this.state <- ent.ord[eachstate]
+    print(this.state)
+    
+   barplot.data <- vul.res.ord %>% 
+      filter(NOM_ENT==this.state)
+      
+    barplot.locs <- barplot.data %>% 
+      ggplot(aes(y= vul_norm, x=NOM_LOC, fill=category_fac))+
+      geom_bar(stat = "identity") +
+      #geom_bar(aes(y= vul_norm, x=NOM_LOC, fill=category_fac), show.legend = FALSE) +
+      scale_fill_manual(values=cols, name = "Vulnerabilidad", drop = FALSE)+
+      coord_flip() +
+      theme_light() +
+      labs(x = "Localidad",
+           y=paste("Vulnerabilidad", escenario.nom),
+           title = this.state) +
+      geom_text(aes(label = vul_rank), vjust = 0)
+    
+  ggsave(here("outputs","figures",paste0(this.state,"_edos_vul_loc.png")), barplot.locs, device="png", width = 8, height = 5)
+  
+  }
+  
+
+```
+
