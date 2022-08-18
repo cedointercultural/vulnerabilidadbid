@@ -47,7 +47,7 @@ vul_analisis <- function(expo_dat, adap_dat, susc_dat, escenario.nom, expo.base)
     left_join(susc.datos, by=c("NOM_ENT","NOM_MUN","COM_ID","NOM_LOC","dec_lon","dec_lat")) %>% 
     left_join(expo.datos, by=c("NOM_ENT","NOM_MUN","COM_ID","NOM_LOC","dec_lon","dec_lat")) %>% 
     mutate(vulnerabilidad = ((exposicion + susceptibilidad) - adaptacion)) %>% 
-    mutate(vulnerabilidad_norm = scales::rescale(vulnerabilidad, to = c(0, 1))) %>% 
+    mutate(vul_norm = scales::rescale(vulnerabilidad, to = c(0, 1))) %>% 
     arrange(region) %>% 
     mutate(escenario = escenario.nom) %>% 
     mutate(category = if_else(vul_norm < 0.25, "Baja", if_else(vul_norm > 0.75, "Alta","Mediana")))
@@ -65,7 +65,7 @@ vul_analisis <- function(expo_dat, adap_dat, susc_dat, escenario.nom, expo.base)
   
   pointplot.vulne <- vul.res.ord %>% 
     ggplot()+
-    geom_point(aes(y= susceptibilidad, x=adaptacion, color=expo_norm)) +
+    geom_point(aes(y= susceptibilidad, x=adaptacion, color=delta_expo_norm)) +
     facet_wrap(~ NOM_ENT_fac) +
     #scale_colour_gradientn(colours= cols) +
     scale_color_gradient(low=cols[2],high=cols[1]) +
@@ -202,7 +202,7 @@ vul_analisis <- function(expo_dat, adap_dat, susc_dat, escenario.nom, expo.base)
     geom_sf() +
     geom_sf(data = susc.coords.proj, aes(color = category_fac), size= 2, shape = 16) +
     #geom_sf(data = susc.coords.proj, aes(size=PCA_norm, color = category), shape = 16) +
-    scale_color_manual(name = nom.indice,
+    scale_color_manual(name = escenario.nom,
                        values = cols)+
     # scale_colour_steps(low="aliceblue", high = "dodgerblue4", breaks = c(0.25, 0.5,0.75)) +
     # geom_sf(data = est.2019, fill= NA) + 
@@ -211,34 +211,34 @@ vul_analisis <- function(expo_dat, adap_dat, susc_dat, escenario.nom, expo.base)
     theme(panel.grid.major = element_line(color = gray(0.4), linetype = "dashed", 
                                           size = 0.1)) +
     theme_light() +
-    labs(color = nom.indice) +
+    labs(color = escenario.nom) +
     theme(legend.position = "none")
   
   mapa.susc2 <- ggplot(data = world) +
     geom_sf() +
     geom_sf(data = susc.coords.proj, aes(color = category_fac), size= 2, shape = 16) +
-    scale_color_manual(name = nom.indice,
+    scale_color_manual(name = escenario.nom,
                        values = cols)+
     coord_sf(xlim = c(-109, -97), ylim = c(12, 28), expand = FALSE) +
     xlab("Longitud") + ylab("Latitud") +
     theme(panel.grid.major = element_line(color = gray(0.4), linetype = "dashed", 
                                           size = 0.1), panel.background = element_rect(fill = "aliceblue")) +
     theme_light() +
-    labs(color = nom.indice) +
+    labs(color = escenario.nom) +
     theme(legend.position = "none")
   
   
   mapa.susc3 <- ggplot(data = world) +
     geom_sf() +
     geom_sf(data = susc.coords.proj, aes(color = category_fac), size= 2, shape = 16) +
-    scale_color_manual(name = nom.indice,
+    scale_color_manual(name = escenario.nom,
                        values = cols)+
     coord_sf(xlim = c(-97, -85), ylim = c(12, 28), expand = FALSE) +
     xlab("Longitud") + ylab("Latitud") +
     theme(panel.grid.major = element_line(color = gray(0.4), linetype = "dashed", 
                                           size = 0.1), panel.background = element_rect(fill = "aliceblue")) +
     theme_light() +
-    labs(color = nom.indice)+
+    labs(color = escenario.nom)+
     theme(legend.text=element_text(size=rel(1.1)),
           legend.title=element_text(size=12))
   
@@ -246,7 +246,7 @@ vul_analisis <- function(expo_dat, adap_dat, susc_dat, escenario.nom, expo.base)
     plot_layout(guides = 'collect')
   
   
-  ggsave(here("outputs","figures",tolower(paste0(nom.indice,"_panel_mapa.png"))), mapa.susc.panel, device="png", width = 10, height = 12)
+  ggsave(here("outputs","figures",tolower(paste0(escenario.nom,"_panel_mapa.png"))), mapa.susc.panel, device="png", width = 10, height = 12)
   
   
   for(eachcategory in c("Alta", "Mediana","Baja")){

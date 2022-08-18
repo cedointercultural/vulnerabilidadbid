@@ -17,6 +17,7 @@ source("vul_analisis.R")
 source("make_map.R")
 source("raster_scale.R")
 source("calc_buffer.R")
+source("read_exposure.R")
 ```
 
                                     
@@ -848,9 +849,10 @@ Golfo de México 2018 \n",file=here("inputs","sensitivity","data_summary","metad
 
 ```
 
+
 ```{r}
 
-#Numero de unidades acuicolas*
+#Numero de unidades acuicolas
 #Hectáreas de cultivo
 
 inegi.cost.wgs <- st_read("~/vulnerabilidadbid/outputs/shp_files/comunidades_costeras_30km.shp") %>% 
@@ -1433,6 +1435,8 @@ lapply(expo.num,expo_raster,vars.expo, coste.buff, cost.data.pob)
 Estimar exposicion
 ```{r calc_expo, include=FALSE}
 
+tabla.edos <- read_csv(here("inputs","estados_region.csv"))
+
 crs.proj.utm <- ("+proj=utm +zone=12 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs +datum=NAD83") 
 crs.proj.wgs <- "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"
 
@@ -1441,16 +1445,7 @@ cost.data.pob <- read_csv(here("outputs","comunidades_costeras_INEGI.csv")) %>% 
 
 expo.summary.files <- list.files(here("inputs","exposure"),pattern="rasterdata.csv", full.names = TRUE)
 
-read_exposure <- function(eachfile){
-  
-  this.data.wide <- read_csv(eachfile) %>% 
-     pivot_wider(names_from = variable, values_from = value) 
-  
-  print(str(this.data.wide))
-  
-  this.data <- read_csv(eachfile)
-  return(this.data)
-}
+
 
 expo.data <- lapply(expo.summary.files,read_exposure) %>% 
   bind_rows 
@@ -1503,21 +1498,21 @@ write_csv(exp.com.ssp.bajo,here("inputs","exposure","data_summary","datos_exposi
 write_csv(exp.com.ssp.alto, here("inputs","exposure","data_summary","datos_exposicion_ssp585.csv"))
 
 #datos historicos
-pca_factor(expo.data.hist, datasetname = "Exposicion_historica")
+pca_factor(expo.data.hist, datasetname = "Exposición_historica")
 
-res.pca.hist <- read_csv(here("outputs","analysis","factor_scores_Exposicion_historica.csv")) %>% 
+res.pca.hist <- read_csv(here("outputs","analysis","factor_scores_Exposición_historica.csv")) %>% 
   mutate(PC1 = scales::rescale(PC1, to = c(0, 1)))
 
 #ssp126
-pca_factor(expo.data.ssp.bajo, datasetname = "Exposicion_ssp126")
+pca_factor(expo.data.ssp.bajo, datasetname = "Exposición_ssp126")
 
-res.pca.ssp.bajo <- read_csv(here("outputs","analysis","factor_scores_Exposicion_ssp126.csv")) %>% 
+res.pca.ssp.bajo <- read_csv(here("outputs","analysis","factor_scores_Exposición_ssp126.csv")) %>% 
   mutate(PC1 = scales::rescale(PC1, to = c(0, 1)))
 
 #ssp585
-pca_factor(expo.data.ssp.bajo, datasetname = "Exposicion_ssp585")
+pca_factor(expo.data.ssp.alto, datasetname = "Exposición_ssp585")
 
-res.pca.ssp.alto <- read_csv(here("outputs","analysis","factor_scores_Exposicion_ssp585.csv")) %>% 
+res.pca.ssp.alto <- read_csv(here("outputs","analysis","factor_scores_Exposición_ssp585.csv")) %>% 
   mutate(PC1 = scales::rescale(PC1, to = c(0, 1)))
 
 cost.data.pob <- read_csv(here("outputs","comunidades_costeras_INEGI.csv")) 
@@ -1555,11 +1550,11 @@ Vulnerabilidad
 
 tabla.edos <- read_csv(here("inputs","estados_region.csv"))
 
-expo.base <- read_csv(here("outputs","analysis","Exposicion_historica_datos_graficos.csv")) %>% 
+expo.base <- read_csv(here("outputs","analysis","Exposición historica_datos_graficos.csv")) %>% 
   dplyr::rename(exposicion_base=PCA_norm)%>% 
   dplyr::select(COM_ID, exposicion_base)
 
-expo_dat  <- here("outputs","analysis","Exposicion_ssp126_datos_graficos.csv")
+expo_dat  <- here("outputs","analysis","Exposición ssp126_datos_graficos.csv")
 adap_dat <- here("outputs","analysis","adaptacion_datos_graficos.csv")
 susc_dat <- here("outputs","analysis","susceptibilidad_datos_graficos.csv")
 escenario.nom <- "Vulnerabilidad ssp126"
@@ -1567,7 +1562,7 @@ escenario.nom <- "Vulnerabilidad ssp126"
 vul_analisis(expo_dat, adap_dat, susc_dat, escenario.nom, expo.base)
 
 
-expo_dat  <- here("outputs","analysis","Exposicion_ssp585_datos_graficos.csv")
+expo_dat  <- here("outputs","analysis","Exposición ssp585_datos_graficos.csv")
 adap_dat <- here("outputs","analysis","adaptacion_datos_graficos.csv")
 susc_dat <- here("outputs","analysis","susceptibilidad_datos_graficos.csv")
 escenario.nom <- "Vulnerabilidad ssp585"
@@ -1659,6 +1654,17 @@ for(eachstate in 1:length(ent.ord)){
   
   }
   
+
+```
+```{r vulnerabilidad entidad}
+
+
+escenario.nom <- "Vulnerabilidad ssp585"
+ent.ord <- c("baja california", "baja california sur","sonora", "sinaloa","nayarit","jalisco", "yucatan","quintana roo","campeche")
+
+vul_analisis_entidad(escenario.nom, ent.ord)
+
+
 
 ```
 
