@@ -49,7 +49,21 @@ pca_factor <- function(thisdata, datasetname){
   # h2is called the communality estimate. Measures the % of variance 
   # in an observed variable accounted for by the retained components
   
+  # prcomp library factoextra
+  #plot variables that continue most to the PCA
+  res.pca <- prcomp(data.set, scale = TRUE)
   
+  fviz_pca_var(res.pca,
+               col.var = "contrib", # Color by contributions to the PC
+               gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+               repel = TRUE     # Avoid text overlapping
+  )
+  
+  variable.plot <-  fviz_cos2(res.pca, choice="var", axes = 1 )
+ 
+  ggplot2::ggsave(here("outputs","figures",paste0("variables_pca_",datasetname,".png")), variable.plot, device="png", width = 8, height = 5)
+  
+   
   # can find the reproduced correlations and the communalities (the diagonals)
   factor.model(model1.impact$loadings)
   

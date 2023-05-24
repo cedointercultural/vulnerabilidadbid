@@ -27,7 +27,7 @@ expo_raster <- function(thisnum, vars.expo, coste.buff, cost.data.pob){
       
     if(grepl("grinundmgw",data.layer)){
       
-      data.shp <- st_read("~/vulnerabilidadbid/outputs/shp_files/comunidades_costeras_30km.shp") %>% 
+      data.shp <- st_read(here::here("outputs","shp_files","comunidades_costeras_30km.shp")) %>% 
         mutate(riesgo_in = VPH_DRE / VIVPAR_H) %>% 
         mutate(riesgo_in = if_else(is.na(riesgo_in), 0, riesgo_in)) %>% 
         mutate(riesgo_in =if_else(is.infinite(riesgo_in), 0, riesgo_in))

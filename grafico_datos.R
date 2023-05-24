@@ -29,14 +29,14 @@ susc.coords <- susc.res
 
 coordinates(susc.coords) <- c("dec_lon","dec_lat")
 
+ent.ord <- susc.res  %>%  distinct(NOM_ENT) %>% pull(NOM_ENT)
+
 #definir proyeccion geografica y proyectar a utm
 proj4string(susc.coords) <- crs.proj.wgs
 susc.coords.sf <- st_as_sf(susc.coords)
 susc.coords.proj <- st_transform(susc.coords.sf, crs.proj.utm) %>% 
   mutate(NOM_ENT_fac=factor(NOM_ENT, levels=ent.ord))  %>% # This trick update the factor levels
   mutate(category_fac=factor(category, levels=c("Alta","Mediana","Baja")))  
-
-ent.ord <- susc.res  %>%  distinct(NOM_ENT) %>% pull(NOM_ENT)
 
 susc.res.ord <-  susc.res %>% 
   mutate(NOM_ENT_fac=factor(NOM_ENT, levels=ent.ord))  %>% # This trick update the factor levels

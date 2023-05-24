@@ -25,7 +25,7 @@ devtools::install_github("valentinitnelav/geobuffer")
               "geobuffer","stringr","Rfast","nFactors","rnaturalearth",
               "gridExtra","exactextractr","here", "patchwork","paletteer",
               "terrainr","plotrix","here","tmap","stringi","tidygeocoder",
-              "Hmisc","stars","gstat","sp") 
+              "Hmisc","stars","gstat","sp","factoextra") 
 #,"plyr"
 # Install CRAN packages (if not already installed)
 .inst <- .packages %in% installed.packages()
