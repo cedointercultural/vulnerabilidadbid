@@ -1656,13 +1656,76 @@ for(eachstate in 1:length(ent.ord)){
   
 
 ```
+
 ```{r vulnerabilidad entidad}
 
 
-escenario.nom <- "Vulnerabilidad ssp585"
-ent.ord <- c("baja california", "baja california sur","sonora", "sinaloa","nayarit","jalisco", "yucatan","quintana roo","campeche")
+cost.data.pob <- read_csv(here("outputs","comunidades_costeras_INEGI.csv")) %>% dplyr::select(COM_ID,NOM_LOC) %>% 
+    mutate(NOM_LOC=tolower(stri_trans_general(str = NOM_LOC, id = "Latin-ASCII")))
 
-vul_analisis_entidad(escenario.nom, ent.ord)
+inegi.2020 <- read_csv(paste0(here(),"/inputs/datos_INEGI_2020/conjunto_de_datos/conjunto_de_datos_iter_00_cpv2020.csv"))
+
+inegi.2020.id <- inegi.2020 %>% 
+  filter(!is.na(LONGITUD)) %>% 
+  mutate(COM_ID = paste0(ENTIDAD,"_",MUN, "_",LOC)) %>% 
+  dplyr::select(COM_ID, everything()) %>% 
+  dplyr::mutate(across(c("NOM_ENT","NOM_MUN","NOM_LOC"), ~ tolower(.))) %>% 
+    dplyr::mutate(across(c("NOM_ENT","NOM_MUN","NOM_LOC"), ~ stri_trans_general(str = ., id = "Latin-ASCII")))
+
+
+lista.comunidades <- readxl::read_xlsx(here("inputs","Lista de comunidades Grupo BSP .xlsx"), sheet = 2) %>% 
+  dplyr::rename(NOM_MUN = Municipio, NOM_ENT = Entidad, NOM_LOC = `Nombre de la comunidad`) %>% 
+  dplyr::mutate(across(NOM_LOC:NOM_ENT, ~ tolower(.))) %>% 
+  dplyr::mutate(NOM_ENT=gsub("californía","california", NOM_ENT)) %>% 
+  dplyr::mutate(across(NOM_LOC:NOM_ENT, ~ stri_trans_general(str = ., id = "Latin-ASCII"))) %>% 
+  dplyr::distinct(NOM_LOC, NOM_MUN, NOM_ENT) %>% 
+  dplyr::mutate(NOM_LOC=if_else(NOM_LOC=="antonio r laureles","antonio r. laureles", NOM_LOC)) 
+
+
+valores.vul.126 <- read_csv(here("outputs","analysis", "vulne_datos_Vulnerabilidad ssp126.csv")) %>% 
+   arrange(desc(vul_norm)) %>% 
+  mutate(vul_rank = 1:nrow(.))
+
+valores.vul.585 <- read_csv(here("outputs","analysis","vulne_datos_Vulnerabilidad ssp585.csv")) %>% 
+  arrange(desc(vul_norm)) %>% 
+  mutate(vul_rank = 1:nrow(.))
+
+vul.ent.126 <- valores.vul.126 %>% 
+  dplyr::group_by(region, NOM_ENT, escenario) %>% 
+  dplyr::summarise(mean_cap = mean(adaptacion), 
+                   sd_cap = sd(adaptacion),
+                   n = n(),
+                   se_cap = sd_cap / sqrt(n),
+                   mean_expo = mean(delta_expo_norm), 
+                   sd_expo = sd(delta_expo_norm),
+                   se_expo = sd_expo / sqrt(n),
+                   mean_susc = mean(susceptibilidad), 
+                   sd_susc = sd(susceptibilidad),
+                   se_susc = sd_susc / sqrt(n),
+                   mean_vul = mean(vul_norm), 
+                   sd_vul = sd(vul_norm),
+                   se_vul = sd_vul / sqrt(n))
+
+readr::write_csv(vul.ent.126, here::here("outputs","analysis","media_entidad_vul_126.csv"))
+
+vul.ent.585 <- valores.vul.585 %>% 
+  dplyr::group_by(region, NOM_ENT, escenario) %>% 
+  dplyr::summarise(mean_cap = mean(adaptacion), 
+                   sd_cap = sd(adaptacion),
+                   n = n(),
+                   se_cap = sd_cap / sqrt(n),
+                   mean_expo = mean(delta_expo_norm), 
+                   sd_expo = sd(delta_expo_norm),
+                   se_expo = sd_expo / sqrt(n),
+                   mean_susc = mean(susceptibilidad), 
+                   sd_susc = sd(susceptibilidad),
+                   se_susc = sd_susc / sqrt(n),
+                   mean_vul = mean(vul_norm), 
+                   sd_vul = sd(vul_norm),
+                   se_vul = sd_vul / sqrt(n))
+
+readr::write_csv(vul.ent.585, here::here("outputs","analysis","media_entidad_vul_585.csv"))
+
 
 
 
