@@ -1569,7 +1569,12 @@ escenario.nom <- "Vulnerabilidad ssp585"
 
 vul_analisis(expo_dat, adap_dat, susc_dat, escenario.nom, expo.base)
 
+expo_dat  <- here("outputs","analysis","Exposición historica_datos_graficos.csv")
+adap_dat <- here("outputs","analysis","adaptacion_datos_graficos.csv")
+susc_dat <- here("outputs","analysis","susceptibilidad_datos_graficos.csv")
+escenario.nom <- "Vulnerabilidad historica"
 
+vul_analisis(expo_dat, adap_dat, susc_dat, escenario.nom, expo.base)
 
 
 ```
